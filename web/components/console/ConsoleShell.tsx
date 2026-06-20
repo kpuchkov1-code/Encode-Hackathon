@@ -6,7 +6,7 @@
   loaded structure wrap the whole tree so every pane shares one source of truth.
 */
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { SelectionProvider } from "@/lib/selection";
 import { StructureProvider } from "@/lib/structureStore";
 import { FilesProvider } from "@/lib/files";
@@ -20,12 +20,39 @@ export function ConsoleShell() {
   const [filesOpen, setFilesOpen] = useState(true);
   const [structOpen, setStructOpen] = useState(true);
 
+  // The console is a fixed, single-screen workspace: lock document scroll and make the body
+  // a full-height flex column while it's mounted, so the shell fills exactly the space under
+  // the (sticky) header regardless of the header's height — no page scrollbar, no clipping.
+  useEffect(() => {
+    const html = document.documentElement;
+    const body = document.body;
+    const prev = {
+      htmlOverflow: html.style.overflow,
+      overflow: body.style.overflow,
+      height: body.style.height,
+      display: body.style.display,
+      flexDirection: body.style.flexDirection,
+    };
+    html.style.overflow = "hidden";
+    body.style.overflow = "hidden";
+    body.style.height = "100dvh";
+    body.style.display = "flex";
+    body.style.flexDirection = "column";
+    return () => {
+      html.style.overflow = prev.htmlOverflow;
+      body.style.overflow = prev.overflow;
+      body.style.height = prev.height;
+      body.style.display = prev.display;
+      body.style.flexDirection = prev.flexDirection;
+    };
+  }, []);
+
   return (
     <SelectionProvider>
       <StructureProvider initialPdbId="6LU7">
         <FilesProvider>
         <JobProvider>
-        <div className="flex h-[calc(100vh-3.5rem)] w-full overflow-hidden">
+        <div className="flex min-h-0 w-full flex-1 overflow-hidden">
           {/* Left — files */}
           <SidePane
             open={filesOpen}
