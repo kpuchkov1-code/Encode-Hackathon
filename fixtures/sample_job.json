@@ -1,0 +1,10 @@
+{
+  "receptor": { "pdb_id": "6LU7" },
+  "ligands": [
+    { "id": "lig_active", "smiles": "CC(=O)Oc1ccccc1C(=O)O" },
+    { "id": "lig_decoy", "smiles": "CC" }
+  ],
+  "box": { "autobox_ligand": "ref_ligand" },
+  "params": { "exhaustiveness": 8, "num_modes": 5, "cnn": "rescore", "seed": 42 },
+  "payment": { "amount": 100, "supplier_id": "node-1" }
+}

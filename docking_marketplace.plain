@@ -4,6 +4,17 @@
 
 - :Endpoint: is an HTTP endpoint of :App:.
 
+- :JobSpec: is the JSON request body that describes a docking job. It is an object with these fields:
+  - `receptor`: an object containing either a `pdb_id` string or a `file` string.
+  - `ligands`: a non-empty array of objects, each having an `id` string and either a `smiles` string or an `sdf` string.
+  - `box`: an object containing either an `autobox_ligand` string, or both a `center` array of three numbers and a `size` array of three numbers.
+  - `params`: an object with `exhaustiveness` (integer), `num_modes` (integer), `cnn` (string), and `seed` (integer).
+  - `payment`: an object with `amount` (number) and `supplier_id` (string).
+
+- :JobState: is a job lifecycle state string, and is one of "queued", "running", "docked", "proven", "settled", or "failed". The initial state is "queued". "failed" is a terminal state that records a reason.
+
+- :Job: is a persisted docking job record with these fields: `job_id` (a UUID string), `state` (a :JobState:), `reason` (a string that is empty unless the state is "failed"), `created_at` (an ISO 8601 timestamp string), and the submitted :JobSpec:.
+
 ***implementation reqs***
 
 - :App: should be implemented in Python (version 3.11 or newer) using the Flask framework.
@@ -13,6 +24,8 @@
 - :App: should declare its Python dependencies in a "requirements.txt" file.
 
 - JSON keys in request and response bodies should use snake_case.
+
+- :App: should persist :Job: records in a SQLite database stored in a local file. The database file path should default to "jobs.db" and be configurable through the `DOCKING_DB_PATH` environment variable. The database schema should be created automatically on startup if it does not already exist.
 
 ***test reqs***
 
@@ -27,3 +40,21 @@
   - A GET request to "/health" returns HTTP status 200.
 
   - The response body of a GET request to "/health" equals the JSON object `{"status": "ok"}`.
+
+- Implement :Endpoint: "POST /jobs" that accepts a :JobSpec: as a JSON request body. It validates the body against :JobSpec:. On success it creates a new :Job: in state "queued", persists it, and returns HTTP status 202 with a JSON body containing the `job_id` and the `state`. If the body is not a valid :JobSpec:, it returns HTTP status 400 with a JSON body containing an `error` message and creates no :Job:.
+
+  ***acceptance tests***
+
+  - Posting a valid :JobSpec: returns HTTP status 202 and a JSON body whose `state` equals "queued" and whose `job_id` is a non-empty string.
+
+  - Posting a body whose `ligands` array is empty returns HTTP status 400 and creates no :Job:.
+
+  - Posting a body that has no `receptor` field returns HTTP status 400 and creates no :Job:.
+
+- Implement :Endpoint: "GET /jobs/<job_id>" that looks up a persisted :Job: by its `job_id`. If the :Job: exists it returns HTTP status 200 with a JSON body containing `job_id`, `state`, and `reason`. If no such :Job: exists it returns HTTP status 404.
+
+  ***acceptance tests***
+
+  - After creating a :Job: with a valid "POST /jobs" request, a "GET /jobs/<job_id>" for the returned `job_id` returns HTTP status 200 and a `state` of "queued".
+
+  - A "GET /jobs/<job_id>" request for a `job_id` that does not exist returns HTTP status 404.
