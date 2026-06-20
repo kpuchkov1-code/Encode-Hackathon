@@ -16,7 +16,7 @@ from typing import Optional
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field, model_validator
 
@@ -128,6 +128,30 @@ def count_ligands(ligands_sdf: str) -> int:
 def estimate_price(num_ligands: int, exhaustiveness: int) -> float:
     price = PRICE_PER_LIGAND_AT_BASELINE * num_ligands * (exhaustiveness / BASELINE_EXHAUSTIVENESS)
     return round(max(price, MIN_PRICE), 2)
+
+
+def default_box_from_receptor(pdb_text: str) -> dict:
+    """Whole-protein bounding box, computed from raw ATOM coordinates with plain
+    string slicing -- no RDKit dependency (the control plane stays lightweight by
+    design). Used when the researcher gives neither a reference ligand nor an explicit
+    center/size: previously this case crashed (float("") on empty form fields) instead
+    of falling back to something that actually runs. Docking against the whole protein
+    surface is far less targeted than a real binding-pocket box, so this is clearly a
+    fallback, not a substitute for providing a reference ligand."""
+    xs, ys, zs = [], [], []
+    for line in pdb_text.splitlines():
+        if line.startswith("ATOM"):
+            try:
+                xs.append(float(line[30:38]))
+                ys.append(float(line[38:46]))
+                zs.append(float(line[46:54]))
+            except ValueError:
+                continue
+    if not xs:
+        raise ValueError("could not find any ATOM coordinates in the uploaded PDB file")
+    center = [(min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2, (min(zs) + max(zs)) / 2]
+    size = [max(max(xs) - min(xs), 20.0), max(max(ys) - min(ys), 20.0), max(max(zs) - min(zs), 20.0)]
+    return {"center": center, "size": size}
 
 
 @app.get("/health")
@@ -294,6 +318,64 @@ def get_result(job_id: str) -> list:
     return job["result"]
 
 
+@app.get("/jobs/{job_id}/download")
+def download_result(job_id: str) -> Response:
+    """Zips the actual docked pose files (sent back inline in the worker callback,
+    since the worker's own job_dir is deleted right after the job ends -- nothing to
+    fetch from the worker's machine after the fact) plus a results.json summary, so
+    the researcher gets a real downloadable file, not just numbers in a browser tab."""
+    import io
+    import json
+    import zipfile
+
+    job = models.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404)
+    if job["state"] not in ("docked", "proven", "settled"):
+        raise HTTPException(status_code=409, detail=f"job is in state {job['state']}, not yet docked")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("results.json", json.dumps(job["result"], indent=2))
+        for entry in job["result"]:
+            if "pose_pdbqt" in entry:
+                zf.writestr(f"{entry['ligand_id']}_pose.pdbqt", entry["pose_pdbqt"])
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename=job-{job_id[:8]}-results.zip"},
+    )
+
+
+@app.get("/jobs/{job_id}/page", response_class=HTMLResponse)
+def get_job_page(job_id: str) -> str:
+    job = models.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404)
+    state = job["state"]
+    body = f"""
+    <h1>Job {job_id[:8]}</h1>
+    <div class="card">
+      <p><strong>Status:</strong> {state}</p>
+      <p><strong>Price:</strong> ${job.get('price', '?')}</p>
+    """
+    if state == "failed":
+        body += f"<p><strong>Reason:</strong> {job.get('reason', '')}</p>"
+    if state in ("docked", "proven", "settled"):
+        rows = "".join(
+            f"<tr><td>{r['ligand_id']}</td><td>{r.get('vina_affinity', r.get('error', ''))}</td></tr>"
+            for r in job["result"]
+        )
+        body += f"""
+          <table><tr><th>Ligand</th><th>Affinity (kcal/mol) / error</th></tr>{rows}</table>
+          <a class="btn" href="/jobs/{job_id}/download">Download results (.zip)</a>
+        """
+    else:
+        body += "<p class=\"lede\">Refresh this page to check progress.</p>"
+    body += "</div>"
+    return page(f"Job {job_id[:8]}", body)
+
+
 class WorkerCallback(BaseModel):
     result: Optional[list[dict]] = None
     error: Optional[str] = None
@@ -311,10 +393,17 @@ def worker_callback(job_id: str, callback: WorkerCallback) -> dict:
         return {"ok": True}
 
     models.update_job(job_id, state="docked", result=callback.result)
-    if job.get("claimed_by"):
-        # Proxy for "earned" -- no real escrow release/blockchain payout yet, see
-        # SESSION_HANDOFF.md §8. Labelled as such on the dashboard.
-        models.increment_worker_stats(job["claimed_by"], completed=True, earned=job.get("price", 0))
+
+    # "Verification" right now is just "the worker reported success" -- there's no real
+    # tamper-evident proof system yet (see SESSION_HANDOFF.md §8). That's the honest
+    # current state, but payment release must still actually happen on success, which
+    # it didn't before this fix: escrow was held on confirm and then never touched
+    # again, so every successful job left it stuck "held" forever.
+    released = models.escrow_release(job_id, proof=True)
+    if released:
+        models.update_job(job_id, state="settled")
+        if job.get("claimed_by"):
+            models.increment_worker_stats(job["claimed_by"], completed=True, earned=job.get("price", 0))
     return {"ok": True}
 
 
@@ -474,12 +563,14 @@ def researchers_submit_form() -> str:
         <input type="file" name="receptor_pdb" required>
         <label>Ligands <span class="hint">(one or more SDF files -- each can contain a whole screening library)</span></label>
         <input type="file" name="ligand_sdfs" multiple required>
-        <label>Reference ligand for docking box <span class="hint">(SDF, optional -- omit to set center/size manually)</span></label>
+        <label>Reference ligand for docking box <span class="hint">(SDF, optional -- defines a precise binding pocket)</span></label>
         <input type="file" name="ref_ligand_sdf">
-        <label>Box center x,y,z <span class="hint">(only if no reference ligand given)</span></label>
+        <label>Box center x,y,z <span class="hint">(optional, only used if no reference ligand given)</span></label>
         <input name="center" placeholder="0,0,0">
-        <label>Box size x,y,z <span class="hint">(only if no reference ligand given)</span></label>
+        <label>Box size x,y,z <span class="hint">(optional, only used if no reference ligand given)</span></label>
         <input name="size" placeholder="20,20,20">
+        <p class="lede">Leaving both blank docks against the whole protein surface
+        instead of a specific pocket -- works, but less targeted.</p>
         <button type="submit">Get price estimate</button>
       </form>
     </div>
@@ -511,11 +602,30 @@ async def researchers_submit_handler(
 
     if ref_ligand_sdf is not None and ref_ligand_sdf.filename:
         box = {"autobox_ligand": (await ref_ligand_sdf.read()).decode()}
+    elif center.strip() and size.strip():
+        try:
+            box = {
+                "center": [float(x) for x in center.split(",")],
+                "size": [float(x) for x in size.split(",")],
+            }
+        except ValueError:
+            return page("Invalid box", """
+            <h1>Invalid box center/size</h1>
+            <p>Center and size must each be three comma-separated numbers, e.g.
+            "0,0,0". <a href="/researchers/submit">Go back</a>.</p>
+            """)
     else:
-        box = {
-            "center": [float(x) for x in center.split(",")],
-            "size": [float(x) for x in size.split(",")],
-        }
+        # Neither a reference ligand nor explicit center/size was given -- this used
+        # to crash (float("") on the empty form fields). Fall back to a whole-protein
+        # box instead of failing outright.
+        try:
+            box = default_box_from_receptor(pdb_text)
+        except ValueError as exc:
+            return page("Could not determine docking box", f"""
+            <h1>Could not determine a docking box</h1>
+            <p>{exc}. Provide a reference ligand or explicit center/size.
+            <a href="/researchers/submit">Go back</a>.</p>
+            """)
 
     job_spec = JobSpec(
         receptor=ReceptorSpec(file=pdb_text),
@@ -556,8 +666,7 @@ def confirm_job_html(request: Request, job_id: str) -> str:
     <h1>Job queued</h1>
     <div class="card">
       <p>Your job is now queued for a worker to pick up.</p>
-      <p>Check status: <a href="{base_url}/jobs/{job_id}">{base_url}/jobs/{job_id}</a></p>
-      <p>Result once docked: <a href="{base_url}/jobs/{job_id}/result">{base_url}/jobs/{job_id}/result</a></p>
+      <a class="btn" href="{base_url}/jobs/{job_id}/page">Check status &amp; download results</a>
     </div>
     """)
 

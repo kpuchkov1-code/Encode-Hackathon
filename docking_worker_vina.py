@@ -77,7 +77,13 @@ def dock_job(job_spec: dict, work_dir: str) -> list[dict]:
             _prep_pdbqt(entry["sdf_path"], ligand_pdbqt, is_receptor=False)
             output_path = os.path.join(work_dir, f"{ligand_id}_out.pdbqt")
             affinity = run_vina(receptor_pdbqt, ligand_pdbqt, job_spec["box"], job_spec["params"], output_path)
-            results.append({"ligand_id": ligand_id, "vina_affinity": affinity, "pose_path": output_path})
+            # The job's work_dir (including this file) is deleted right after the job
+            # ends -- see worker_daemon.py's "no retention after the job settles". So
+            # the pose content has to be sent back now, in the result itself, or the
+            # researcher has no way to ever see/download the actual docked structure.
+            with open(output_path) as f:
+                pose_pdbqt = f.read()
+            results.append({"ligand_id": ligand_id, "vina_affinity": affinity, "pose_pdbqt": pose_pdbqt})
         except Exception as exc:  # noqa: BLE001 -- one ligand's failure must not abort the job
             results.append({"ligand_id": ligand_id, "error": str(exc)})
 
