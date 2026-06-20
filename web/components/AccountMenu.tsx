@@ -3,39 +3,18 @@
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { useAccount } from "@/lib/account";
 
-// Mock auth for the demo: persisted in localStorage, no backend. Provides the top-right
-// sign-in + account/settings/wallet menu.
-
-type User = { name: string; email: string; initial: string; credits: number };
-
-const DEMO_USER: User = {
-  name: "Demo Lab",
-  email: "demo@lab.bio",
-  initial: "D",
-  credits: 1240,
-};
-
-const STORAGE_KEY = "dm_user";
+// Top-right sign-in + account/settings/wallet menu. Account state is shared via AccountProvider
+// so the nav's compute-balance chip stays in sync on sign in/out.
 
 export function AccountMenu() {
-  const [mounted, setMounted] = useState(false);
-  const [user, setUser] = useState<User | null>(null);
+  const { user, ready, signIn: doSignIn, signOut: doSignOut } = useAccount();
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const pathname = usePathname() ?? "";
   const isActive = (href: string) =>
     pathname === href || pathname.startsWith(`${href}/`);
-
-  useEffect(() => {
-    setMounted(true);
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) setUser(JSON.parse(raw));
-    } catch {
-      /* ignore */
-    }
-  }, []);
 
   useEffect(() => {
     if (!open) return;
@@ -47,27 +26,17 @@ export function AccountMenu() {
   }, [open]);
 
   function signIn() {
-    setUser(DEMO_USER);
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(DEMO_USER));
-    } catch {
-      /* ignore */
-    }
+    doSignIn();
     setOpen(false);
   }
 
   function signOut() {
-    setUser(null);
-    try {
-      localStorage.removeItem(STORAGE_KEY);
-    } catch {
-      /* ignore */
-    }
+    doSignOut();
     setOpen(false);
   }
 
-  // Render a stable placeholder until mounted to avoid hydration mismatch.
-  if (!mounted) {
+  // Render a stable placeholder until the initial read completes (avoids hydration mismatch).
+  if (!ready) {
     return <div className="h-8 w-20" aria-hidden="true" />;
   }
 

@@ -61,15 +61,19 @@ export function DockingViewer({
     let disposed = false;
 
     (async () => {
-      const mol = await import("@/lib/molstar");
-      if (disposed) return;
-      const plugin = await mol.createViewer(canvas, host);
-      if (disposed) {
-        plugin.dispose();
-        return;
+      try {
+        const mol = await import("@/lib/molstar");
+        if (disposed) return;
+        const plugin = await mol.createViewer(canvas, host);
+        if (disposed) {
+          plugin.dispose();
+          return;
+        }
+        pluginRef.current = plugin;
+        setPluginReady(true);
+      } catch (err) {
+        if (!disposed) console.warn("[docking] viewer init failed:", err);
       }
-      pluginRef.current = plugin;
-      setPluginReady(true);
     })();
 
     return () => {
@@ -92,12 +96,12 @@ export function DockingViewer({
     setLoaded(false);
 
     (async () => {
-      const mol = await import("@/lib/molstar");
-      if (!pdbText) {
-        await plugin.clear();
-        return;
-      }
       try {
+        const mol = await import("@/lib/molstar");
+        if (!pdbText) {
+          await plugin.clear();
+          return;
+        }
         await mol.loadPdb(plugin, pdbText);
         if (!cancelled) setLoaded(true);
       } catch {
@@ -116,32 +120,47 @@ export function DockingViewer({
     if (!plugin || !loaded || !pdbText) return;
     let cancelled = false;
     let timer: ReturnType<typeof setInterval> | undefined;
-
+    // Skip a tick if the previous placement is still committing — stacking clearLigand→rebuild
+    // calls races Mol*'s internal state and is what throws deep in the engine. Self-contained
+    // so a Mol* hiccup degrades to a warning instead of an unhandled promise rejection.
+    let inFlight = false;
     const place = async (seed: number, spread: number, focus: boolean) => {
-      const mol = await import("@/lib/molstar");
-      const sdf = poseSdf ?? buildPoseSdf(center, seed, spread);
-      if (cancelled) return;
-      await mol.addLigandSdf(plugin, sdf, focus);
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const mol = await import("@/lib/molstar");
+        const sdf = poseSdf ?? buildPoseSdf(center, seed, spread);
+        if (cancelled) return;
+        await mol.addLigandSdf(plugin, sdf, focus);
+      } catch (err) {
+        if (!cancelled) console.warn("[docking] pose render skipped:", err);
+      } finally {
+        inFlight = false;
+      }
     };
 
     (async () => {
-      const mol = await import("@/lib/molstar");
-      if (!state || !ACTIVE.includes(state)) {
-        await mol.clearLigand(plugin);
-        mol.setSpin(plugin, false);
-        return;
-      }
-      if (state === "running" && !poseSdf) {
-        mol.setSpin(plugin, true);
-        let k = 1;
-        await place(base + k, SEARCH_SPREAD, true);
-        timer = setInterval(() => {
-          k += 1;
-          void place(base + k, SEARCH_SPREAD, false);
-        }, 1100);
-      } else {
-        mol.setSpin(plugin, false);
-        await place(base, SETTLED_SPREAD, true);
+      try {
+        const mol = await import("@/lib/molstar");
+        if (!state || !ACTIVE.includes(state)) {
+          await mol.clearLigand(plugin);
+          mol.setSpin(plugin, false);
+          return;
+        }
+        if (state === "running" && !poseSdf) {
+          mol.setSpin(plugin, true);
+          let k = 1;
+          await place(base + k, SEARCH_SPREAD, true);
+          timer = setInterval(() => {
+            k += 1;
+            void place(base + k, SEARCH_SPREAD, false);
+          }, 1100);
+        } else {
+          mol.setSpin(plugin, false);
+          await place(base, SETTLED_SPREAD, true);
+        }
+      } catch (err) {
+        if (!cancelled) console.warn("[docking] update failed:", err);
       }
     })();
 
