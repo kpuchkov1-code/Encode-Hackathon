@@ -26,15 +26,11 @@ export default function Home() {
       {/* Scrim for legibility */}
       <div className="absolute inset-0 -z-10 bg-gradient-to-b from-background/85 via-background/65 to-background/90" />
 
-      <section className="mx-auto flex min-h-[calc(100vh-3.5rem)] max-w-4xl flex-col items-center justify-center px-6 py-16 text-center">
-        <h1 className="max-w-3xl text-4xl font-semibold leading-tight tracking-tight drop-shadow-[0_2px_20px_rgba(0,0,0,0.6)] sm:text-5xl">
+      <section className="mx-auto flex min-h-[calc(100vh-5rem)] max-w-4xl flex-col items-center justify-center px-6 py-16 text-center">
+        <h1 className="max-w-4xl text-5xl font-semibold leading-[1.05] tracking-tight drop-shadow-[0_2px_20px_rgba(0,0,0,0.6)] sm:text-6xl lg:text-7xl">
           The compute exchange for{" "}
           <span className="text-accent">molecular science</span>.
         </h1>
-        <p className="mt-5 max-w-xl text-base leading-relaxed text-foreground/75 drop-shadow-[0_2px_12px_rgba(0,0,0,0.7)] sm:text-lg">
-          Rent idle GPUs to run real molecular workloads. Settled on-chain, with
-          cryptographic proof of execution.
-        </p>
 
         {/* Workload breadth */}
         <div className="mt-6 flex flex-wrap items-center justify-center gap-2">
@@ -64,23 +60,7 @@ export default function Home() {
             frameClassName="h-11 w-11"
           />
         </div>
-
-        {/* Live network stats */}
-        <div className="mt-10 flex flex-wrap items-center justify-center gap-x-8 gap-y-2 font-mono text-xs text-muted">
-          <Stat value="128" label="GPUs online" />
-          <Stat value="3,412" label="jobs run" />
-          <Stat value="100%" label="proof-verified" />
-        </div>
       </section>
     </main>
-  );
-}
-
-function Stat({ value, label }: { value: string; label: string }) {
-  return (
-    <span className="flex items-baseline gap-1.5">
-      <span className="text-sm text-foreground">{value}</span>
-      <span>{label}</span>
-    </span>
   );
 }

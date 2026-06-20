@@ -36,7 +36,7 @@ export function RunsPanel() {
   }
 
   return (
-    <div className="flex max-h-[34vh] flex-col border-t border-border">
+    <div className="flex h-full flex-col">
       <div className="flex items-center justify-between px-3 py-2">
         <span className="font-mono text-[11px] uppercase tracking-wider text-muted">
           Runs

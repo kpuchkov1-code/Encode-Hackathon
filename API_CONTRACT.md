@@ -108,6 +108,14 @@ Proof of execution (Walrus stand-in). Available once `state` is `proven`/`settle
 ```
 Sorted by `cnn_affinity` descending (best binder first). Higher `cnn_affinity` = better.
 
+> **Docking viewer (3D pose) — optional extension.** The buyer console's split structure pane
+> renders the top pose in 3D. Until real geometry exists it shows a *representative* candidate at
+> the pocket (inferred from the receptor's bound-ligand atoms). To render the **real gnina pose**,
+> return the pose's SDF text alongside the result — either add an optional `pose_sdf` (string,
+> V2000/V3000 SDF) field to each `LigandResult`, or serve it at `GET /jobs/<id>/pose/<ligand_id>`
+> (`200 → text/plain` SDF). The frontend passes that text to `DockingViewer` via `poseSdf`; nothing
+> else changes. `pose_path` stays as the canonical storage reference.
+
 ### Proof (`GET /jobs/<id>/proof`)
 ```json
 {

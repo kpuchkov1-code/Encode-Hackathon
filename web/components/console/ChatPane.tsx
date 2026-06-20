@@ -20,7 +20,13 @@ const SUGGESTIONS = [
   "What does CNN affinity tell me?",
 ];
 
-export function ChatPane() {
+export function ChatPane({
+  filesOpen,
+  onToggleFiles,
+}: {
+  filesOpen: boolean;
+  onToggleFiles: () => void;
+}) {
   const { applyClientTool, getContext } = useClientTools();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
@@ -53,8 +59,30 @@ export function ChatPane() {
   const rendered = useMemo(() => toRenderItems(messages), [messages]);
   const empty = messages.length === 0;
 
+  function newChat() {
+    setMessages([]);
+    setInput("");
+    setError(null);
+  }
+
   return (
     <div className="flex h-full flex-col">
+      {/* Header bar — matches the Files / Structure pane headers for a cohesive 3-pane look. */}
+      <div className="flex items-center justify-between border-b border-border bg-surface px-4 py-2">
+        <span className="font-mono text-[11px] uppercase tracking-wider text-muted">
+          Copilot
+        </span>
+        {!empty && (
+          <button
+            type="button"
+            onClick={newChat}
+            className="rounded-md border border-border bg-surface-2 px-2 py-0.5 font-mono text-[10px] text-muted transition-colors hover:border-accent/50 hover:text-foreground"
+          >
+            + new chat
+          </button>
+        )}
+      </div>
+
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-6 py-6">
         <div className="mx-auto max-w-2xl space-y-4">
           {empty && <Greeting onPick={send} />}
@@ -133,7 +161,7 @@ export function ChatPane() {
             </button>
           </div>
           <div className="mt-2 flex items-center gap-1.5">
-            <Toggle active label="Files" />
+            <Toggle active={filesOpen} onClick={onToggleFiles} label="Files" />
             <Toggle active label="Tools" />
             <Toggle active={web} onClick={() => setWeb((v) => !v)} label="🌐 Web Search" />
           </div>

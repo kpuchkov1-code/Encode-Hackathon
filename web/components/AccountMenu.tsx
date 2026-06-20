@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
+import { usePathname } from "next/navigation";
 
 // Mock auth for the demo: persisted in localStorage, no backend. Provides the top-right
 // sign-in + account/settings/wallet menu.
@@ -22,6 +23,9 @@ export function AccountMenu() {
   const [user, setUser] = useState<User | null>(null);
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  const pathname = usePathname() ?? "";
+  const isActive = (href: string) =>
+    pathname === href || pathname.startsWith(`${href}/`);
 
   useEffect(() => {
     setMounted(true);
@@ -93,6 +97,24 @@ export function AccountMenu() {
 
       {open && (
         <div className="absolute right-0 top-full z-50 mt-2 w-60 overflow-hidden rounded-xl border border-border bg-surface shadow-xl shadow-black/40">
+          {/* Marketplace side switcher — available signed in or out. */}
+          <div className="border-b border-border p-1.5">
+            <SideItem
+              href="/console"
+              active={isActive("/console")}
+              label="Run"
+              sub="Submit docking jobs"
+              onClick={() => setOpen(false)}
+            />
+            <SideItem
+              href="/sell"
+              active={isActive("/sell")}
+              label="Provide"
+              sub="Rent out your GPUs"
+              onClick={() => setOpen(false)}
+            />
+          </div>
+
           {user ? (
             <>
               <div className="border-b border-border px-4 py-3">
@@ -105,9 +127,6 @@ export function AccountMenu() {
                   {user.credits.toLocaleString()} credits
                 </span>
               </div>
-              <MenuLink href="/sell" onClick={() => setOpen(false)}>
-                Provider dashboard
-              </MenuLink>
               <MenuLink href="/settings" onClick={() => setOpen(false)}>
                 Settings
               </MenuLink>
@@ -141,6 +160,43 @@ export function AccountMenu() {
         </div>
       )}
     </div>
+  );
+}
+
+function SideItem({
+  href,
+  active,
+  label,
+  sub,
+  onClick,
+}: {
+  href: string;
+  active: boolean;
+  label: string;
+  sub: string;
+  onClick: () => void;
+}) {
+  return (
+    <Link
+      href={href}
+      onClick={onClick}
+      aria-current={active ? "page" : undefined}
+      className={`flex items-center justify-between rounded-lg px-3 py-2 transition-colors ${
+        active ? "bg-accent/15" : "hover:bg-surface-2"
+      }`}
+    >
+      <span className="min-w-0">
+        <span
+          className={`block text-sm font-medium ${
+            active ? "text-accent-bright" : "text-foreground"
+          }`}
+        >
+          {label}
+        </span>
+        <span className="block text-[11px] text-muted">{sub}</span>
+      </span>
+      {active && <span className="h-2 w-2 shrink-0 rounded-full bg-accent" />}
+    </Link>
   );
 }
 

@@ -11,10 +11,10 @@ import { PluginContext } from "molstar/lib/mol-plugin/context";
 import { DefaultPluginSpec } from "molstar/lib/mol-plugin/spec";
 import { Color } from "molstar/lib/mol-util/color";
 import {
+  Structure,
   StructureElement,
   StructureProperties,
   StructureSelection,
-  type Structure,
 } from "molstar/lib/mol-model/structure";
 import { Script } from "molstar/lib/mol-script/script";
 import { MolScriptBuilder as MS } from "molstar/lib/mol-script/language/builder";
@@ -24,6 +24,11 @@ export { PluginContext, Color };
 
 const ORANGE = Color(0xf59e0b); // matches the app's residue-selection colour
 const CANVAS_BG = Color(0x0a0a0b); // near-black console canvas
+const LIGAND_COLOR = Color(0x22d3ee); // cyan — the docking candidate, distinct from grey HETATM
+
+// Per-plugin ref of the currently-added candidate ligand (the rawData node). Deleting it
+// cascades to its trajectory/model/structure/representation, so one delete clears the pose.
+const ligandRefs = new Map<PluginContext, string>();
 
 /** Create + initialise a headless Mol* plugin bound to the given canvas/container. */
 export async function createViewer(
@@ -116,4 +121,53 @@ export function setSpin(plugin: PluginContext, on: boolean): void {
 /** Recentre the camera on the whole structure. */
 export function resetCamera(plugin: PluginContext): void {
   plugin.managers.camera.reset();
+}
+
+/**
+ * Add (or replace) the docking candidate ligand from raw SDF text, rendered as a cyan
+ * ball-and-stick so it stands out from any crystal HETATM. Optionally focus the camera on
+ * it. Any previously-added candidate is removed first, so calling this repeatedly animates
+ * the pose without touching the receptor.
+ */
+export async function addLigandSdf(
+  plugin: PluginContext,
+  sdfText: string,
+  focus = false,
+): Promise<void> {
+  await clearLigand(plugin);
+
+  const data = await plugin.builders.data.rawData({ data: sdfText });
+  ligandRefs.set(plugin, data.ref);
+  const traj = await plugin.builders.structure.parseTrajectory(data, "sdf");
+  const model = await plugin.builders.structure.createModel(traj);
+  const struct = await plugin.builders.structure.createStructure(model);
+  await plugin.builders.structure.representation.addRepresentation(struct, {
+    type: "ball-and-stick",
+    color: "uniform",
+    colorParams: { value: LIGAND_COLOR },
+    size: "uniform",
+    sizeParams: { value: 0.5 },
+  });
+
+  if (focus) {
+    try {
+      const structure = struct.data;
+      if (structure) plugin.managers.camera.focusLoci(Structure.Loci(structure));
+    } catch {
+      /* keep whatever framing we had */
+    }
+  }
+  plugin.canvas3d?.requestDraw();
+}
+
+/** Remove the docking candidate ligand (if any). Leaves the receptor untouched. */
+export async function clearLigand(plugin: PluginContext): Promise<void> {
+  const prev = ligandRefs.get(plugin);
+  if (!prev) return;
+  ligandRefs.delete(plugin);
+  try {
+    await plugin.build().delete(prev).commit();
+  } catch {
+    /* node already gone */
+  }
 }

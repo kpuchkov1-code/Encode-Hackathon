@@ -7,6 +7,9 @@ const nextConfig: NextConfig = {
   turbopack: {
     root: path.resolve(__dirname),
   },
+  // Hide the Next.js dev-mode indicator (the floating circle in the bottom-left
+  // corner). It only ever renders during `next dev`, never in production.
+  devIndicators: false,
 };
 
 export default nextConfig;
