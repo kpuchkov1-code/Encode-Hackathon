@@ -9,37 +9,27 @@ POST /jobs/{job_id}/worker-callback. The control plane never blocks on a docking
 
 Hand-written (Codeplain dropped, see SESSION_HANDOFF.md).
 """
-import io
 import os
 import sys
 import uuid
-import zipfile
 from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field, model_validator
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, REPO_ROOT)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import models  # noqa: E402
 
 app = FastAPI(title="docking-marketplace-control-plane")
 
-# Files that make up the worker package -- everything a hardware provider needs to run
-# the daemon, and *only* that. Never the control plane's own source (api/, models.py),
-# and never anything that would require git/GitHub access to this private repo.
-WORKER_PACKAGE_FILES = [
-    "install_worker.sh",
-    "worker_daemon.py",
-    "docking_worker.py",
-    "docking_worker_vina.py",
-    "worker_setup.py",
-    "engine_entrypoint_vina.py",
-    "requirements-worker.txt",
-    "vina-test/Dockerfile",
-]
+# The worker package (everything a hardware provider needs -- and *only* that, never
+# the control plane's own source) is served as a static file from public/, built by
+# scripts/build_worker_package.sh, not generated dynamically here. Vercel's Python
+# build only auto-bundles files reachable via actual `import` statements, so trying to
+# zip arbitrary sibling files at request time silently fails in production (confirmed
+# the hard way -- see git history). Static assets in public/** have no such issue.
 
 
 @app.exception_handler(RequestValidationError)
@@ -95,6 +85,16 @@ class JobSpec(BaseModel):
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
+
+
+@app.get("/worker-package.zip")
+def worker_package_local_dev_fallback() -> FileResponse:
+    """In production, Vercel serves public/** as a static asset directly -- this
+    route never actually runs there (see https://vercel.com/docs/frameworks/backend/fastapi,
+    "app.mount is not needed and should not be used"). It exists purely so
+    `python api/index.py` behaves the same way for local testing."""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "public", "worker-package.zip")
+    return FileResponse(path, media_type="application/zip", filename="worker-package.zip")
 
 
 @app.post("/jobs", status_code=202)
@@ -215,7 +215,7 @@ def providers_signup_submit(request: Request, worker_id: str = Form(...)) -> str
       <li>Make sure Python 3 is installed (<code>python3 --version</code> in a terminal;
         most Mac/Linux machines already have it -- on Windows, use WSL).</li>
       <li>Download and unpack the worker setup package:
-        <pre>curl -L {base_url}/download/worker-package.zip -o worker-package.zip
+        <pre>curl -L {base_url}/worker-package.zip -o worker-package.zip
 unzip worker-package.zip -d worker-package
 cd worker-package
 chmod +x install_worker.sh</pre>
@@ -239,21 +239,6 @@ chmod +x install_worker.sh</pre>
         may be assigned to run it automatically.</li>
     </ol>
     """
-
-
-@app.get("/download/worker-package.zip")
-def download_worker_package() -> Response:
-    """Everything a hardware provider needs to run the daemon, packaged on demand from
-    this server's own deployed files -- never git/GitHub access to the backend repo."""
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for rel_path in WORKER_PACKAGE_FILES:
-            zf.write(os.path.join(REPO_ROOT, rel_path), arcname=rel_path)
-    return Response(
-        content=buf.getvalue(),
-        media_type="application/zip",
-        headers={"Content-Disposition": "attachment; filename=worker-package.zip"},
-    )
 
 
 @app.get("/workers/{worker_id}")
