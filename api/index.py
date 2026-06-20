@@ -180,19 +180,50 @@ def providers_signup_form() -> str:
     """
 
 
+GITHUB_REPO_URL = "https://github.com/kpuchkov1-code/Encode-Hackathon"
+GITHUB_BRANCH = "backend/handwritten-vercel-worker-split"  # TODO: update once merged to main
+
+
 @app.post("/providers/signup", response_class=HTMLResponse)
 def providers_signup_submit(request: Request, worker_id: str = Form(...)) -> str:
     models.register_worker(worker_id, "(pending -- starts once the daemon runs and detects it)")
     base_url = str(request.base_url).rstrip("/")
+    run_cmd = f"CONTROL_PLANE_URL={base_url} WORKER_ID={worker_id} ./install_worker.sh"
     return f"""
     <h1>Signed up: {worker_id}</h1>
-    <p>Step 2 -- run this on the machine providing compute (needs Python 3 + Docker;
-    nothing else is installed on your machine, the docking engine is sealed inside a
-    per-job container):</p>
-    <pre>CONTROL_PLANE_URL={base_url} WORKER_ID={worker_id} ./install_worker.sh</pre>
-    <p>On startup the daemon detects your hardware (CPU cores, GPU if present) and
-    reports it back automatically -- check <a href="{base_url}/workers/{worker_id}">{base_url}/workers/{worker_id}</a>
-    after starting it to confirm.</p>
+    <p>Follow these steps on the computer that will actually provide compute (it can be
+    a different machine than the one you're signing up from):</p>
+    <ol>
+      <li>Install Docker if you don't already have it:
+        <a href="https://docs.docker.com/get-docker/">https://docs.docker.com/get-docker/</a>.
+        Make sure it's running (e.g. <code>docker --version</code> works in a terminal).
+      </li>
+      <li>Make sure Python 3 is installed (<code>python3 --version</code> in a terminal;
+        most Mac/Linux machines already have it -- on Windows, use WSL).</li>
+      <li>Open a terminal and download the code:
+        <pre>git clone {GITHUB_REPO_URL}.git
+cd Encode-Hackathon
+git checkout {GITHUB_BRANCH}
+chmod +x install_worker.sh</pre>
+      </li>
+      <li>Run this exact command (already has your worker ID and this server's address
+        filled in) and leave the terminal window open -- the daemon only receives jobs
+        while it's running:
+        <pre>{run_cmd}</pre>
+        The first run also builds a small (~300MB) Docker image -- this only happens
+        once. After that, nothing else gets installed on your machine; the docking
+        software runs sealed inside a disposable container per job, never touching
+        your system Python or packages.
+      </li>
+      <li>Confirm it worked: the terminal should print a line like
+        <code>registered with control plane: 8 CPU cores, Linux, x86_64</code>
+        (your actual hardware), then <code>polling for jobs...</code>. You can also
+        check <a href="{base_url}/workers/{worker_id}">{base_url}/workers/{worker_id}</a>
+        in a browser to see what hardware was detected.
+      </li>
+      <li>That's it -- leave it running. When a researcher submits a job, your machine
+        may be assigned to run it automatically.</li>
+    </ol>
     """
 
 
