@@ -1,4 +1,4 @@
-import Link from "next/link";
+import HoverFramesRoleCard from "@/components/HoverFramesRoleCard";
 
 const WORKLOADS = [
   "Molecular docking",
@@ -50,8 +50,19 @@ export default function Home() {
 
         {/* The two doors */}
         <div className="mt-10 grid w-full gap-4 sm:grid-cols-2">
-          <RoleCard href="/console" title="Pay for compute" primary />
-          <RoleCard href="/sell" title="Rent out your hardware" />
+          <HoverFramesRoleCard
+            href="/console"
+            title="Pay for compute"
+            frames={["/dna-a.jpg", "/dna-b.jpg"]}
+            frameClassName="h-10 w-[3.5rem]"
+            primary
+          />
+          <HoverFramesRoleCard
+            href="/sell"
+            title="Rent out your hardware"
+            frames={["/pc-a.png", "/pc-b.png"]}
+            frameClassName="h-11 w-11"
+          />
         </div>
 
         {/* Live network stats */}
@@ -62,32 +73,6 @@ export default function Home() {
         </div>
       </section>
     </main>
-  );
-}
-
-function RoleCard({
-  href,
-  title,
-  primary,
-}: {
-  href: string;
-  title: string;
-  primary?: boolean;
-}) {
-  return (
-    <Link
-      href={href}
-      className={`group flex items-center justify-between rounded-2xl border p-6 text-left backdrop-blur-md transition-all ${
-        primary
-          ? "border-accent/50 bg-accent/10 hover:border-accent/80"
-          : "border-border bg-surface/70 hover:border-accent/50 hover:bg-surface-2/80"
-      }`}
-    >
-      <span className="text-2xl font-semibold tracking-tight">{title}</span>
-      <span className="text-xl text-accent transition-transform group-hover:translate-x-1">
-        →
-      </span>
-    </Link>
   );
 }
 
