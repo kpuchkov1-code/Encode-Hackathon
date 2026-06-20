@@ -74,3 +74,29 @@ body {
 .animate-node-pulse {
   animation: node-pulse 1.6s ease-in-out infinite;
 }
+
+/*
+  Page transition — replayed on every route change via app/template.tsx (which remounts on
+  navigation). A gentle fade + rise + de-blur so pages ease in instead of snapping.
+*/
+@keyframes page-transition-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+    filter: blur(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+    filter: blur(0);
+  }
+}
+.page-transition {
+  animation: page-transition-in 0.32s cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: opacity, transform, filter;
+}
+@media (prefers-reduced-motion: reduce) {
+  .page-transition {
+    animation: none;
+  }
+}
