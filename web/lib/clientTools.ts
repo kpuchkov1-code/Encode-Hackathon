@@ -48,7 +48,9 @@ export function useClientTools() {
           const text = structure.text;
           if (!text) return { error: "no structure loaded" };
           const { cleaned, removed } = cleanPdb(text);
-          structure.loadStructure(structure.pdbId, cleaned, "cleaned");
+          structure.loadStructure(structure.pdbId, cleaned, "cleaned", {
+            uploaded: structure.uploaded,
+          });
           return { removed, note: "viewer now shows the cleaned structure" };
         }
         case "highlight_residues": {

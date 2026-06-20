@@ -1,133 +1,131 @@
 "use client";
 
 /*
-  Selection-aware 3Dmol viewer. Loads the structure from the shared structure store and
-  lets the user CLICK residues to select them — selected residues turn orange (the Amina
-  interaction). Selection lives in the shared store, so the sequence strip and job panel
-  react to the same clicks.
+  Selection-aware Mol* viewer. Mol* (the engine behind RCSB/PDBe) renders publication-grade
+  cartoons — smooth ribbons, real secondary-structure assignment, ambient occlusion + outlines
+  — replacing the lower-poly 3Dmol render.
 
-  Base cartoon is blue; selected residues are restyled orange + sticks on each selection
-  change. Zoom is clamped so you can't fly through or lose the molecule.
+  Interaction is unchanged from the user's point of view: click a residue in 3D OR the
+  sequence strip and it turns orange. Clicks in 3D toggle the shared selection store; the store
+  (also driven by the sequence strip + chat) is mirrored back into Mol* as the orange marking.
 */
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useSelection } from "@/lib/selection";
 import { useStructure } from "@/lib/structureStore";
-
-const ZOOM_MIN = 40;
-const ZOOM_MAX = 500;
-const BASE_COLOR = "#3b82f6";
-const SELECT_COLOR = "#f59e0b";
+import type { PluginContext } from "@/lib/molstar";
 
 export function StructureViewer() {
   const { text, status, pdbId, source } = useStructure();
   const { selected, toggle, clear, summary } = useSelection();
 
   const hostRef = useRef<HTMLDivElement>(null);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const viewerRef = useRef<any>(null);
-  const homeViewRef = useRef<number[] | null>(null);
-  const [ready, setReady] = useState(false);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const pluginRef = useRef<PluginContext | null>(null);
+  const [pluginReady, setPluginReady] = useState(false);
+  const [loaded, setLoaded] = useState(false);
   const [spinning, setSpinning] = useState(false);
 
-  // Keep the latest toggle in a ref so the click handler (bound once at load) stays current.
+  // Keep the latest toggle in a ref so the click handler (bound once) stays current.
   const toggleRef = useRef(toggle);
   useEffect(() => {
     toggleRef.current = toggle;
   }, [toggle]);
 
-  // (Re)build the viewer whenever the structure text changes.
+  // Create the Mol* plugin once, against the canvas/container.
   useEffect(() => {
-    if (!text) {
-      setReady(false);
-      return;
-    }
+    const canvas = canvasRef.current;
+    const host = hostRef.current;
+    if (!canvas || !host) return;
+    let disposed = false;
+    let sub: { unsubscribe: () => void } | null = null;
+
+    (async () => {
+      const mol = await import("@/lib/molstar");
+      if (disposed) return;
+      const plugin = await mol.createViewer(canvas, host);
+      if (disposed) {
+        plugin.dispose();
+        return;
+      }
+      pluginRef.current = plugin;
+
+      // Click an atom -> toggle that residue in the shared selection store.
+      sub = plugin.behaviors.interaction.click.subscribe((e) => {
+        const key = mol.residueKeyFromLoci(e?.current?.loci);
+        if (key) toggleRef.current(key);
+      });
+
+      setPluginReady(true);
+    })();
+
+    return () => {
+      disposed = true;
+      sub?.unsubscribe();
+      try {
+        pluginRef.current?.dispose();
+      } catch {
+        /* noop */
+      }
+      pluginRef.current = null;
+      setPluginReady(false);
+    };
+  }, []);
+
+  // (Re)load the structure whenever the coordinate text changes.
+  useEffect(() => {
+    const plugin = pluginRef.current;
+    if (!plugin || !pluginReady) return;
     let cancelled = false;
-    setReady(false);
+    setLoaded(false);
     setSpinning(false);
 
     (async () => {
-      const host = hostRef.current;
-      if (!host) return;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const $3Dmol: any = await import("3dmol");
-      if (cancelled) return;
-
-      host.replaceChildren();
-      const viewer = $3Dmol.createViewer(host, {
-        backgroundColor: "#0a0a0b",
-        antialias: true,
-        upscale: true,
-        ambientOcclusion: { strength: 0.45, radius: 5 },
-      });
-      viewerRef.current = viewer;
-
-      viewer.addModel(text, "pdb");
-      viewer.setStyle({}, { cartoon: { color: BASE_COLOR, arrows: true } });
-
-      // Click an atom -> toggle that residue in the shared selection store.
-      viewer.setClickable({}, true, (atom: { chain?: string; resi?: number }) => {
-        if (atom?.resi == null) return;
-        const chain = atom.chain || "A";
-        toggleRef.current(`${chain}:${atom.resi}`);
-      });
-
-      viewer.zoomTo();
-      viewer.zoom(1.15, 0);
-      viewer.render();
-      viewer.setZoomLimits(ZOOM_MIN, ZOOM_MAX);
-      homeViewRef.current = viewer.getView();
-      if (!cancelled) setReady(true);
+      const mol = await import("@/lib/molstar");
+      if (!text) {
+        await plugin.clear();
+        return;
+      }
+      try {
+        await mol.loadPdb(plugin, text);
+        if (!cancelled) setLoaded(true);
+      } catch {
+        /* the store already surfaces load errors */
+      }
     })();
 
     return () => {
       cancelled = true;
-      try {
-        viewerRef.current?.clear?.();
-      } catch {
-        /* noop */
-      }
-      viewerRef.current = null;
     };
-  }, [text]);
+  }, [text, pluginReady]);
 
-  // Restyle on selection change: reset to blue, overlay selected residues in orange.
+  // Mirror the shared selection into Mol* as the orange marking.
   useEffect(() => {
-    const v = viewerRef.current;
-    if (!v || !ready) return;
-    v.setStyle({}, { cartoon: { color: BASE_COLOR, arrows: true } });
+    const plugin = pluginRef.current;
+    if (!plugin || !loaded) return;
+    let cancelled = false;
+    (async () => {
+      const mol = await import("@/lib/molstar");
+      if (!cancelled) mol.markResidues(plugin, selected);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [selected, loaded]);
 
-    if (selected.size > 0) {
-      const byChain: Record<string, number[]> = {};
-      for (const key of selected) {
-        const [chain, resiStr] = key.split(":");
-        const resi = Number(resiStr);
-        if (Number.isNaN(resi)) continue;
-        (byChain[chain] ??= []).push(resi);
-      }
-      for (const chain of Object.keys(byChain)) {
-        v.addStyle(
-          { chain, resi: byChain[chain] },
-          { cartoon: { color: SELECT_COLOR }, stick: { color: SELECT_COLOR, radius: 0.2 } },
-        );
-      }
-    }
-    v.render();
-  }, [selected, ready]);
-
-  const resetView = useCallback(() => {
-    const v = viewerRef.current;
-    if (!v) return;
-    if (homeViewRef.current) v.setView(homeViewRef.current);
-    else v.zoomTo();
-    v.render();
+  const resetView = useCallback(async () => {
+    const plugin = pluginRef.current;
+    if (!plugin) return;
+    const mol = await import("@/lib/molstar");
+    mol.resetCamera(plugin);
   }, []);
 
-  const toggleSpin = useCallback(() => {
-    const v = viewerRef.current;
-    if (!v) return;
+  const toggleSpin = useCallback(async () => {
+    const plugin = pluginRef.current;
+    if (!plugin) return;
+    const mol = await import("@/lib/molstar");
     setSpinning((on) => {
-      v.spin(on ? false : "y");
+      mol.setSpin(plugin, !on);
       return !on;
     });
   }, []);
@@ -139,9 +137,7 @@ export function StructureViewer() {
           <span className="rounded-md bg-surface-2 px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider text-muted">
             PDB ID
           </span>
-          <span className="font-mono text-sm text-foreground">
-            {pdbId || "—"}
-          </span>
+          <span className="font-mono text-sm text-foreground">{pdbId || "—"}</span>
         </div>
         <div className="flex items-center gap-1">
           {selected.size > 0 && (
@@ -153,17 +149,19 @@ export function StructureViewer() {
               clear {selected.size}
             </button>
           )}
-          <CtrlButton label="Spin" active={spinning} disabled={!ready} onClick={toggleSpin}>
+          <CtrlButton label="Spin" active={spinning} disabled={!loaded} onClick={toggleSpin}>
             <SpinIcon />
           </CtrlButton>
-          <CtrlButton label="Reset view" disabled={!ready} onClick={resetView}>
+          <CtrlButton label="Reset view" disabled={!loaded} onClick={resetView}>
             <ResetIcon />
           </CtrlButton>
         </div>
       </div>
 
       <div className="relative flex-1">
-        <div ref={hostRef} className="absolute inset-0" />
+        <div ref={hostRef} className="absolute inset-0">
+          <canvas ref={canvasRef} className="h-full w-full" />
+        </div>
         {status !== "ready" && (
           <div className="pointer-events-none absolute inset-0 grid place-items-center">
             {status === "idle" && (
@@ -177,12 +175,12 @@ export function StructureViewer() {
             )}
           </div>
         )}
-        {ready && (
+        {loaded && (
           <div className="pointer-events-none absolute bottom-2 left-3 font-mono text-[10px] text-muted">
             source: {source} · click residues to select · scroll to zoom
           </div>
         )}
-        {ready && summary && (
+        {loaded && summary && (
           <div className="absolute right-2 top-2 max-w-[60%] truncate rounded-md border border-select/40 bg-select/10 px-2 py-1 text-right font-mono text-[10px] text-select-bright">
             {summary}
           </div>

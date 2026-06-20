@@ -1,7 +1,25 @@
 "use client";
 
-import type { DockResult } from "@/lib/types";
+import type { DockResult, LigandResult } from "@/lib/types";
 import { SponsorBadge } from "./SponsorBadge";
+
+function toCsv(rows: LigandResult[]): string {
+  const header = "rank,ligand_id,cnn_affinity,cnn_score,vina_affinity,pose_path";
+  const lines = rows.map((l, i) =>
+    [i + 1, l.ligand_id, l.cnn_affinity, l.cnn_score, l.vina_affinity, l.pose_path].join(","),
+  );
+  return [header, ...lines].join("\n");
+}
+
+function downloadCsv(result: DockResult, rows: LigandResult[]) {
+  const blob = new Blob([toCsv(rows)], { type: "text/csv" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `docking_${result.job_id.slice(0, 8)}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
 
 export function ResultsTable({ result }: { result: DockResult | undefined }) {
   // Defensive: rank by cnn_affinity desc (best binder first).
@@ -14,9 +32,18 @@ export function ResultsTable({ result }: { result: DockResult | undefined }) {
       <div className="mb-4 flex items-center gap-2">
         <h2 className="text-sm font-semibold tracking-tight">Docking results</h2>
         <SponsorBadge name="gnina" />
-        <span className="ml-auto text-[11px] text-muted">
-          ranked by CNN affinity
-        </span>
+        {result && rows.length > 0 && (
+          <button
+            type="button"
+            onClick={() => downloadCsv(result, rows)}
+            className="ml-auto rounded-md border border-border bg-surface-2 px-2 py-1 font-mono text-[10px] text-muted transition-colors hover:border-accent/50 hover:text-foreground"
+          >
+            ⤓ export CSV
+          </button>
+        )}
+        {(!result || rows.length === 0) && (
+          <span className="ml-auto text-[11px] text-muted">ranked by CNN affinity</span>
+        )}
       </div>
 
       {!result ? (

@@ -13,6 +13,7 @@ import { FilesProvider } from "@/lib/files";
 import { JobProvider } from "@/lib/jobStore";
 import { StructurePane } from "./StructurePane";
 import { FilesPanel } from "./FilesPanel";
+import { RunsPanel } from "./RunsPanel";
 import { ChatPane } from "./ChatPane";
 
 export function ConsoleShell() {
@@ -33,7 +34,12 @@ export function ConsoleShell() {
             onToggle={() => setFilesOpen((v) => !v)}
             widthClass="w-72"
           >
-            <FilesPanel />
+            <div className="flex h-full flex-col">
+              <div className="min-h-0 flex-1 overflow-hidden">
+                <FilesPanel />
+              </div>
+              <RunsPanel />
+            </div>
           </SidePane>
 
           {/* Center — chat */}

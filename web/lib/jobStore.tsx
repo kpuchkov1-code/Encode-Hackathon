@@ -14,7 +14,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import type { Box, JobParams, JobSpec, Ligand } from "./types";
+import type { Box, JobParams, JobSpec, Ligand, Receptor } from "./types";
 import type { BoxSpec } from "./structure";
 
 export interface PocketState {
@@ -45,15 +45,19 @@ const SAMPLE_LIGANDS: Ligand[] = [
 export interface JobStore {
   draft: JobDraft;
   setLigands: (ligands: Ligand[]) => void;
+  addLigands: (ligands: Ligand[]) => void;
+  updateLigand: (index: number, patch: Partial<Ligand>) => void;
+  removeLigand: (index: number) => void;
   loadSampleLigands: () => void;
   setPocketFromBox: (box: BoxSpec, label: string) => void;
   setAutobox: (refLigand: string) => void;
   setAmount: (amount: number) => void;
   setSupplier: (id: string) => void;
+  setParams: (patch: Partial<JobParams>) => void;
   /** Active job id once Run has been clicked. */
   jobId: string | null;
   setJobId: (id: string | null) => void;
-  buildSpec: (receptorPdbId: string) => JobSpec;
+  buildSpec: (receptor: Receptor) => JobSpec;
 }
 
 const JobContext = createContext<JobStore | null>(null);
@@ -70,6 +74,23 @@ export function JobProvider({ children }: { children: ReactNode }) {
 
   const setLigands = useCallback(
     (ligands: Ligand[]) => setDraft((d) => ({ ...d, ligands })),
+    [],
+  );
+  const addLigands = useCallback(
+    (ligands: Ligand[]) => setDraft((d) => ({ ...d, ligands: [...d.ligands, ...ligands] })),
+    [],
+  );
+  const updateLigand = useCallback(
+    (index: number, patch: Partial<Ligand>) =>
+      setDraft((d) => ({
+        ...d,
+        ligands: d.ligands.map((l, i) => (i === index ? { ...l, ...patch } : l)),
+      })),
+    [],
+  );
+  const removeLigand = useCallback(
+    (index: number) =>
+      setDraft((d) => ({ ...d, ligands: d.ligands.filter((_, i) => i !== index) })),
     [],
   );
   const loadSampleLigands = useCallback(
@@ -97,10 +118,15 @@ export function JobProvider({ children }: { children: ReactNode }) {
     (id: string) => setDraft((d) => ({ ...d, supplierId: id })),
     [],
   );
+  const setParams = useCallback(
+    (patch: Partial<JobParams>) =>
+      setDraft((d) => ({ ...d, params: { ...d.params, ...patch } })),
+    [],
+  );
 
   const buildSpec = useCallback(
-    (receptorPdbId: string): JobSpec => ({
-      receptor: { pdb_id: receptorPdbId },
+    (receptor: Receptor): JobSpec => ({
+      receptor,
       ligands: draft.ligands,
       box: draft.pocket?.box ?? { autobox_ligand: "ref_ligand" },
       params: draft.params,
@@ -113,11 +139,15 @@ export function JobProvider({ children }: { children: ReactNode }) {
     () => ({
       draft,
       setLigands,
+      addLigands,
+      updateLigand,
+      removeLigand,
       loadSampleLigands,
       setPocketFromBox,
       setAutobox,
       setAmount,
       setSupplier,
+      setParams,
       jobId,
       setJobId,
       buildSpec,
@@ -125,11 +155,15 @@ export function JobProvider({ children }: { children: ReactNode }) {
     [
       draft,
       setLigands,
+      addLigands,
+      updateLigand,
+      removeLigand,
       loadSampleLigands,
       setPocketFromBox,
       setAutobox,
       setAmount,
       setSupplier,
+      setParams,
       jobId,
       buildSpec,
     ],
