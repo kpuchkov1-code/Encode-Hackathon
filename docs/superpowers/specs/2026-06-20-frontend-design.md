@@ -45,10 +45,10 @@ viewer, monospace data blocks, suggestion-card affordances).
 
 - **Background:** true near-black (`~#0A0A0B`), elevated surfaces a touch lighter
   (`~#141416`). Content floats; minimal borders, soft separation.
-- **Accent:** violet (`~#7C5CFF`). Single restrained accent — used for the active pipeline
-  step, the molecular structure, primary CTAs, and the proof-verified state. Avoid a second
-  competing accent. Green reserved for the `ok`/`released` success micro-states; amber/red
-  for `failed`/`refunded`.
+- **Accent:** blue (`~#3B82F6` / electric blue). Single restrained accent — used for the
+  active pipeline step, the molecular structure, primary CTAs, and the proof-verified state.
+  Avoid a second competing accent. Green reserved for the `ok`/`released` success
+  micro-states; amber/red for `failed`/`refunded`.
 - **Typography:** geometric sans for prose/labels; **monospace** for all machine values
   (job_id, sha256, SMILES, cnn_affinity, vina_affinity, blob ids).
 - **Affordances:** dark suggestion cards (white title + muted subtitle) for presets and
@@ -86,11 +86,17 @@ WSL `localhost:8000` backend, or run `next dev` locally against `http://localhos
 
 | Route | Purpose |
 |---|---|
-| `/` | Landing — AminoAnalytica-style greeting + suggestion cards. Marketplace pitch (the ~$50k-per-100k-compound-screen problem) folded in. Primary CTA → `/submit`. |
+| `/` | **Role-chooser landing** for the two-sided marketplace. Two doors: "I need compute" → `/buy`, "I have GPUs" → `/sell`. |
+| `/buy` | Buyer home — marketplace pitch (the ~$50k-per-100k-compound-screen problem) + suggestion cards. Primary CTA → `/submit`. |
 | `/submit` | JobSpec wizard. Left: form. Right: live 3Dmol receptor preview (renders as PDB ID is entered). Suggestion cards for presets (load sample, trigger-failure). |
-| `/jobs/[id]` | **Hero screen.** Split-pane. Left: pipeline stepper + escrow + results + proof, progressively revealed as state advances. Right: persistent 3Dmol receptor viewer + monospace info block. |
+| `/jobs/[id]` | **Buyer hero screen.** Split-pane. Left: pipeline stepper + escrow + results + proof, progressively revealed as state advances. Right: persistent 3Dmol receptor viewer + monospace info block. |
+| `/sell` | **Provider dashboard** (supply side). Node card (connect/online, mocked GPU specs), earnings (derived from settled escrow), live job feed with simulated "Run". |
 
 `/jobs` history list view is **out of scope** for v1 (mock serves it; add only if time remains).
+
+**Pivot note (2026-06-20):** product reframed from docking-only to a general **bio-compute
+marketplace**. The supply side (below) was promoted from out-of-scope to in-scope; the buyer
+flow is unchanged.
 
 ---
 
@@ -136,6 +142,23 @@ Split-pane, the centrepiece of the demo.
 
 ---
 
+## 6b. The provider dashboard (`/sell`, supply side)
+
+Honest framing: the API contract has **no supply-side endpoints** (no node registration, no
+job-claim). Per the original handoff, supply is "mostly mocked — supply-side recruitment is
+the open problem, not the thing being proven." So the dashboard is wired to **real** `GET
+/jobs` + escrow data, but node specs and the "Run" action are simulated and labelled as such.
+
+- **NodeCard:** offline by default. "Connect hardware" flips to online and shows mocked
+  specs (node_id `node-1`, RTX 4090, 24 GB, CUDA 12.4, eu-west-1) + an offline toggle. Using
+  `node-1` means the node owns the sample jobs' escrow, so earnings populate.
+- **EarningsPanel (DeepBook):** earned (sum of `released` escrow where `supplier_id` = node),
+  pending payout (`held`), jobs completed. Derived live from escrow.
+- **JobFeed:** polls `GET /jobs`; rows show job, state, reward (escrow amount), action.
+  Queued jobs get a **Run** button (disabled until the node is online); clicking it
+  optimistically tags the job as claimed-by-you. Settled → "+ paid", failed → "refunded".
+- A persistent disclosure line states the simulated parts.
+
 ## 7. Data layer
 
 - **`lib/types.ts`** — TypeScript types mirroring `API_CONTRACT.md` exactly. snake_case keys
@@ -158,7 +181,7 @@ Split-pane, the centrepiece of the demo.
 - `EscrowPanel` (DeepBook) — held/released/refunded, amount, supplier, take-rate line.
 - `ResultsTable` (gnina) — ranked ligand rows, mono numbers, best-binder highlight.
 - `ProofPanel` (Walrus) — manifest hash hero, hash list, params, blob id, Verify/copy.
-- `ReceptorViewer` — 3Dmol.js wrapper, loads PDB ID from RCSB, violet cartoon, near-black bg.
+- `ReceptorViewer` — 3Dmol.js wrapper, loads PDB ID from RCSB, blue cartoon, near-black bg.
 - `JobInfoBlock` — monospace metadata panel (right column).
 - `SubmitForm` — PDB ID input, repeatable ligand rows (id + smiles), Advanced collapsibles
   (box, params), supplier select, "Load sample" + preset suggestion cards.
@@ -182,7 +205,6 @@ Split-pane, the centrepiece of the demo.
 
 ## 10. Out of scope (YAGNI for v1)
 
-- Supply-side (GPU owner) dashboard — demand-side only.
 - `/jobs` history list view — mock serves it; add only if time remains.
 - Docked-pose 3D overlay — needs an unbuilt backend pose endpoint. (Receptor-only viewer
   IS in scope, client-side from RCSB.)
