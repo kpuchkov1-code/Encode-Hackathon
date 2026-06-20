@@ -29,6 +29,7 @@ export interface SelectionStore {
   isSelected: (key: string) => boolean;
   toggle: (key: string) => void;
   add: (keys: string[]) => void;
+  remove: (keys: string[]) => void;
   set: (keys: string[]) => void;
   clear: () => void;
   /** Human-readable summary, runs collapsed: "A:140-145, A:150". */
@@ -100,6 +101,14 @@ export function SelectionProvider({ children }: { children: ReactNode }) {
     });
   }, []);
 
+  const remove = useCallback((keys: string[]) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      for (const k of keys) next.delete(k);
+      return next;
+    });
+  }, []);
+
   const set = useCallback((keys: string[]) => {
     setSelected(new Set(keys));
   }, []);
@@ -112,12 +121,13 @@ export function SelectionProvider({ children }: { children: ReactNode }) {
       isSelected: (key: string) => selected.has(key),
       toggle,
       add,
+      remove,
       set,
       clear,
       summary: summarizeSelection(selected),
       byChain: groupByChain(selected),
     }),
-    [selected, toggle, add, set, clear],
+    [selected, toggle, add, remove, set, clear],
   );
 
   return (

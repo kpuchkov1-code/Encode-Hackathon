@@ -36,11 +36,13 @@ export async function createViewer(
 
   plugin.canvas3d?.setProps({
     renderer: { backgroundColor: CANVAS_BG, selectColor: ORANGE },
-    // Depth-cued ambient occlusion + crisp silhouettes — the "publication-grade" look.
+    // Soft ambient occlusion for depth — NO outline (the thick black silhouette looked harsh).
     postprocessing: {
       occlusion: { name: "on", params: { samples: 32, radius: 5, bias: 0.8, blurKernelSize: 15, resolutionScale: 1, multiScale: { name: "off", params: {} }, color: Color(0x000000) } },
-      outline: { name: "on", params: { scale: 1, threshold: 0.33, color: Color(0x000000), includeTransparent: true } },
+      outline: { name: "off", params: {} },
     },
+    // Hide the bottom-left orientation axes gizmo.
+    camera: { helper: { axes: { name: "off", params: {} } } },
   });
 
   return plugin;

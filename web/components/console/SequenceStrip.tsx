@@ -2,10 +2,15 @@
 
 /*
   Monospace sequence strip, linked to the same selection store as the 3D viewer. Each
-  residue is a clickable cell; selected residues glow orange in both places. Rows are
-  numbered by the first residue in the row (Amina-style sequence panel).
+  residue is a cell; selected residues glow orange in both places (and in the Mol* viewer).
+
+  Drag to select chunks: press on a residue and drag across the sequence to select a run.
+  The drag mode is set by the first cell — start on an unselected residue to ADD a chunk,
+  start on a selected one to REMOVE a chunk. A plain click toggles a single residue.
 */
 
+import { useCallbackRef } from "@/lib/useCallbackRef";
+import { useEffect, useRef } from "react";
 import { useStructure } from "@/lib/structureStore";
 import { useSelection } from "@/lib/selection";
 import type { ChainInfo, ResidueInfo } from "@/lib/structure";
@@ -24,7 +29,7 @@ export function SequenceStrip() {
   }
 
   return (
-    <div className="max-h-[34vh] overflow-y-auto px-3 py-2">
+    <div className="max-h-[34vh] select-none overflow-y-auto px-3 py-2">
       {parsed.chains.map((chain) => (
         <ChainRows key={chain.id} chain={chain} />
       ))}
@@ -33,14 +38,54 @@ export function SequenceStrip() {
 }
 
 function ChainRows({ chain }: { chain: ChainInfo }) {
-  const { selected } = useSelection();
+  const { selected, isSelected, add, remove } = useSelection();
   const selectedCount = chain.residues.filter((r) =>
     selected.has(`${chain.id}:${r.resi}`),
   ).length;
 
-  const rows: ResidueInfo[][] = [];
+  // Drag state lives in refs so the per-cell handlers stay stable across renders.
+  const dragging = useRef(false);
+  const anchor = useRef<number | null>(null);
+  const mode = useRef<"add" | "remove">("add");
+
+  const keyAt = (idx: number) => `${chain.id}:${chain.residues[idx].resi}`;
+
+  // End any drag on a global pointerup (even if released off a cell).
+  useEffect(() => {
+    const end = () => {
+      dragging.current = false;
+      anchor.current = null;
+    };
+    window.addEventListener("pointerup", end);
+    return () => window.removeEventListener("pointerup", end);
+  }, []);
+
+  const applyRange = useCallbackRef((a: number, b: number) => {
+    const lo = Math.min(a, b);
+    const hi = Math.max(a, b);
+    const keys: string[] = [];
+    for (let i = lo; i <= hi; i++) keys.push(keyAt(i));
+    if (mode.current === "add") add(keys);
+    else remove(keys);
+  });
+
+  const onCellDown = useCallbackRef((idx: number) => {
+    dragging.current = true;
+    anchor.current = idx;
+    mode.current = isSelected(keyAt(idx)) ? "remove" : "add";
+    applyRange(idx, idx);
+  });
+
+  const onCellEnter = useCallbackRef((idx: number) => {
+    if (!dragging.current || anchor.current == null) return;
+    applyRange(anchor.current, idx);
+  });
+
+  const rows: { residue: ResidueInfo; index: number }[][] = [];
   for (let i = 0; i < chain.residues.length; i += ROW) {
-    rows.push(chain.residues.slice(i, i + ROW));
+    rows.push(
+      chain.residues.slice(i, i + ROW).map((residue, j) => ({ residue, index: i + j })),
+    );
   }
 
   return (
@@ -60,29 +105,49 @@ function ChainRows({ chain }: { chain: ChainInfo }) {
       </div>
       <div className="space-y-0.5">
         {rows.map((row, i) => (
-          <SeqRow key={i} chainId={chain.id} row={row} />
+          <SeqRow
+            key={i}
+            chainId={chain.id}
+            row={row}
+            onCellDown={onCellDown}
+            onCellEnter={onCellEnter}
+          />
         ))}
       </div>
     </div>
   );
 }
 
-function SeqRow({ chainId, row }: { chainId: string; row: ResidueInfo[] }) {
-  const { isSelected, toggle } = useSelection();
+function SeqRow({
+  chainId,
+  row,
+  onCellDown,
+  onCellEnter,
+}: {
+  chainId: string;
+  row: { residue: ResidueInfo; index: number }[];
+  onCellDown: (idx: number) => void;
+  onCellEnter: (idx: number) => void;
+}) {
+  const { isSelected } = useSelection();
   return (
     <div className="flex items-center gap-2">
       <span className="w-10 shrink-0 text-right font-mono text-[10px] text-muted">
-        {row[0]?.resi}
+        {row[0]?.residue.resi}
       </span>
       <div className="flex flex-wrap">
-        {row.map((res) => {
+        {row.map(({ residue: res, index }) => {
           const key = `${chainId}:${res.resi}`;
           const on = isSelected(key);
           return (
             <button
               key={res.resi}
               type="button"
-              onClick={() => toggle(key)}
+              onPointerDown={(e) => {
+                e.preventDefault();
+                onCellDown(index);
+              }}
+              onPointerEnter={() => onCellEnter(index)}
               title={`${res.resn} ${res.resi}`}
               className={`h-[18px] w-[13px] text-center font-mono text-[11px] leading-[18px] transition-colors ${
                 on
