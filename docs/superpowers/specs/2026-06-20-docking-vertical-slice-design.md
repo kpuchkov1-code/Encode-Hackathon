@@ -5,12 +5,18 @@
 **Repo:** https://github.com/kpuchkov1-code/Encode-Hackathon
 **Hackathon:** Encode Vibe Coding Hackathon (3 days, AI-only build). Bounties targeted by the wider project: Solvimon, ~~Codeplain~~, Sui (DeepBook & Walrus), Vercel. This spec covers **only the docking vertical slice**.
 
-**Update 2026-06-20:** Codeplain has been dropped (see `SESSION_HANDOFF.md` §7) after
-render-loop friction (a path bug, then real CPU docking runs blowing past the 120s
-conformance-test timeout) made it slower than hand-writing the same logic. The backend
-is now hand-written Python. References to ".plain specs" / "rendered" below describe
-the original plan, not the current build — kept for historical context, not as
-instructions to follow.
+**Update 2026-06-20 (superseded — see `SESSION_HANDOFF.md` for current state):**
+Codeplain has been dropped after render-loop friction made it slower than hand-writing
+the same logic. The backend is now hand-written Python, split into a Vercel-deployable
+control plane (`api/index.py`) and a separate orchestrator (`worker_daemon.py`) that
+runs on provider hardware and executes jobs in **per-job Docker containers** — this
+directly resolves §11.1's "marketplace gap" below (the worker is no longer in-process
+on the API host). Two engine images exist: gnina (real target, not yet successfully
+built on the dev machine) and AutoDock Vina (lightweight, built and verified working).
+References to ".plain specs", "WSL2", "rendered", and the in-process worker model
+throughout this document describe the original plan, not the current build — kept for
+historical context (the confidentiality constraints in §11.2 still apply once real
+Sui calls are built), not as instructions to follow.
 
 ---
 

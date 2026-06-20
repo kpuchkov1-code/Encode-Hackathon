@@ -1,268 +1,273 @@
-# SESSION HANDOFF — Decentralized Docking Marketplace (backend / docking slice)
+# SESSION HANDOFF — Decentralized Docking Marketplace
 
-**Read this first when resuming.** It is the single source of truth for picking up
-the backend build in a fresh Claude Code session. Pair it with:
-- `docs/superpowers/specs/2026-06-20-docking-vertical-slice-design.md` (design spec)
-- `docs/superpowers/plans/2026-06-20-docking-vertical-slice.md` (task-by-task plan)
-- `docs/CODEPLAIN_NOTES.md` (Codeplain mechanics)
+**Read this first when resuming.** Pair it with:
+- `docs/superpowers/specs/2026-06-20-docking-vertical-slice-design.md` (original design spec — historical, see note at its top)
+- `docs/superpowers/specs/2026-06-20-frontend-job-submission-design.md` (frontend contract, Kirill's workstream)
 
-Last updated: 2026-06-20. Backend is at **Tasks 0–3 complete, Task 4 next.**
+Last updated: 2026-06-20. **Architecture has changed substantially since the original
+plan** (Codeplain dropped, control-plane/worker split for Vercel, Docker-per-job engine
+execution). This doc reflects current reality, not the original 6-task Codeplain plan.
 
 ---
 
 ## 1. What we are building
 
-A **decentralized compute marketplace for biotech virtual screening**: it connects
-idle consumer/institutional GPUs to biotech labs running **molecular docking** jobs,
-with on-chain payment settlement and cryptographically verifiable job provenance.
+A decentralized compute marketplace for molecular docking: a researcher submits a job
+(protein PDB + ligand SDF), pays, and the job runs on a third party's idle hardware.
+That hardware owner gets paid for the compute. Full target flow (not all built yet):
 
-The full product is a two-sided marketplace (GPU suppliers ↔ labs submitting docking
-jobs). **This workstream builds only the backend "docking vertical slice"**: submit a
-job → a real docking engine (**gnina**) runs it on the GPU → a tamper-evident **proof
-of execution** is produced → a **mock escrow** releases payment against that proof.
-Real blockchain/billing integrations are stubbed behind interfaces and swapped in later.
+1. **Provider** signs up on the website, registers hardware, installs a local daemon
+   that polls for work.
+2. **Researcher** signs up, submits a job (PDB + SDF), gets a cost estimate, accepts,
+   pays via Sui, job is queued.
+3. **Server** assigns the job to a registered/polling provider (currently: first-come
+   FIFO claim, not capability-matched).
+4. That provider's daemon pulls/builds the right Docker image for the job's docking
+   engine and runs it.
+5. Result is verified (tamper-evident proof — **not built yet**).
+6. Researcher is notified, downloads results, verifies the job ran correctly.
+7. Payment releases to the provider.
 
-The load-bearing differentiator is that the docking is **real and inspectable** (real
-CNN affinity scores from gnina), not a hollow UI moving fake job IDs around.
+## 2. Major architecture decisions (chronological, why each happened)
 
-## 2. Hackathon + sponsors (why each piece exists)
+### 2.1 Codeplain dropped
+After repeated friction (a relative-path bug in generated code, then real CPU docking
+runs blowing past Codeplain's 120s conformance-test timeout, each costing render
+credits to discover), Codeplain was dropped entirely. **Accepted tradeoff: lost
+eligibility for the Codeplain bounty.** `docking_marketplace.plain` stays in the repo
+as a historical reference for the `JobSpec`/`Job`/`Escrow` shapes only — not
+maintained, not executable.
 
-**Encode Vibe Coding Hackathon** — 3 days, build using AI only. Four bounties targeted
-(FLock and UK Sovereign AI are explicitly OUT of scope — never reference them):
+### 2.2 Control plane / worker split (because of Vercel)
+A Vercel serverless function cannot run gnina/Vina docking itself: execution-time
+limits and no persistent process. So the backend split into:
+- **Control plane** (`api/index.py`) — Vercel-deployable FastAPI app. Job intake,
+  validation, escrow record, status, claim queue. Never runs docking.
+- **Worker daemon** (`worker_daemon.py`) — runs on the provider's own machine, not on
+  Vercel. Polls the control plane (`POST /jobs/claim`), runs the job, reports back.
 
-| Sponsor | Role in the build | Where |
-|---|---|---|
-| **Codeplain** | Spec-to-code compiler. The backend is authored as `.plain` specs, NOT hand-written. Bounty requires `.plain` files committed (genuine primary use). | `docking_marketplace.plain` |
-| **Sui — DeepBook** | On-chain payment/escrow/settlement. Currently **mocked** (`:Escrow:`, JSON ledger). Real DeepBook swaps in later behind the same interface. | escrow layer |
-| **Sui — Walrus** | Decentralized storage for job provenance (proof blobs). Currently **mocked** (`:Storage:`, content-addressed local folder — to be built in Task 5). | proof/storage layer |
-| **Solvimon** | Usage-based billing/metering of the marketplace take-rate (10–20%). Not in the docking slice; later phase. | deferred |
-| **Vercel / v0** | Frontend (job submission UI, dashboards). Separate workstream, not this backend — Kirill builds it. Design now defined: `docs/superpowers/specs/2026-06-20-frontend-job-submission-design.md`. | defined, deferred (Kirill's build) |
+### 2.3 Pull-based claim, not push-dispatch
+Originally the control plane pushed jobs directly to a fixed worker URL. Wrong model:
+idle-compute providers (home machines) typically sit behind NAT and can't accept
+inbound connections. Switched to polling: `POST /jobs/claim` is polled by daemons;
+`claim_next_job` does an atomic pop so concurrent daemons can't double-claim.
 
-Demo-day judging notes: Sui = demo-first, both DeepBook + Walrus need *visible* roles
-(no decorative imports). Codeplain = judges check for real `.plain` usage. Solvimon =
-"most likely to be a successful business" (lean on the real ~$50k/100k-compound cost
-wall + a narrow beachhead: university comp-bio communities).
+### 2.4 Per-job Docker container, not a monolithic worker image
+The orchestrator (`worker_daemon.py`) itself has almost no dependencies (`requests`
++ the Docker CLI) and runs directly on the provider's host. For each claimed job, it
+runs `docker run <engine-image>` — a **fresh, disposable container per job** — rather
+than being itself one big container with gnina/RDKit baked in. This means:
+- The provider's host is never polluted with RDKit/gnina/CUDA packages.
+- Different jobs could in principle use different engine images (different docking
+  backends) without the orchestrator needing to know how to install any of them.
+- GPU passthrough is a host-level decision (`docker run --gpus all`, checked once via
+  `nvidia-smi` + `docker info` for the NVIDIA Container Toolkit), not a per-job concern.
 
-## 3. Architecture (the docking slice)
+Contract between orchestrator and engine image: orchestrator writes
+`job_spec.json` into a temp dir, bind-mounts it at `/job`, runs the container, reads
+back `/job/result.json` (`{"result": [...]}` or `{"error": "..."}`).
 
-```
-Buyer ─POST /jobs─▶ Flask API (Codeplain-authored, Python)
-                     │  state machine: queued→running→docked→proven→settled / failed
-                     │  SQLite (jobs.db) + JSON escrow ledger
-                     ├─▶ Docking Worker  ── shells out ──▶ gnina (WSL, GPU)   [Task 4]
-                     ├─▶ Proof Packager  (hash manifest) ─▶ Storage (Walrus stub) [Task 5]
-                     └─▶ Escrow (DeepBook stub): hold→release(proof)/refund   [Task 3/6]
-```
+### 2.5 Two engine images: gnina (real target) and Vina (fast test path)
+- **gnina** (`Dockerfile`, `gnina-bin/`) is the real target engine (CNN rescoring,
+  legitimizes the GPU-compute pitch). Heavy: ~3.3GB image (CUDA-compat libs even for
+  CPU-only hosts — gnina dynamically links cuDNN/etc. regardless of `--no_gpu`). Build
+  takes 5-10 minutes. **Status: Dockerfile is correct and gnina binary is
+  pre-downloaded to `gnina-bin/gnina` (gitignored, ~1.4GB) to avoid re-downloading on
+  every build, but the image has not been successfully built+tested end-to-end yet** —
+  repeatedly interrupted by disk-space exhaustion on this dev machine (see §4) and a
+  real bug (see §5). Known-good as of last build attempt: the Dockerfile is correct.
+- **AutoDock Vina** (`vina-test/Dockerfile`, `docking_worker_vina.py`,
+  `engine_entrypoint_vina.py`) is a deliberately lightweight stand-in (313MB image,
+  ~2 min build, no CUDA deps at all — Vina has no GPU/CNN scoring) used to validate the
+  per-job Docker architecture quickly. **Status: built and verified working
+  end-to-end** against the real local PDB fixtures (see §6). Vina remains the working
+  path until gnina's build is finished; gnina is not abandoned, just deferred.
 
-Everything except the gnina binary is generated by Codeplain from `docking_marketplace.plain`.
-gnina is an installed native dependency the generated Python calls via subprocess.
+Both engines reuse `docking_worker.py`'s `prepare_receptor`/`split_ligands` (engine-
+agnostic RDKit-based receptor PDB cleaning and multi-ligand SDF splitting) — only the
+actual docking call + result parsing differs per engine.
 
-## 4. Environment (already set up — exact paths)
+### 2.6 Persistence: Upstash REST (Vercel KV), not SQLite/local JSON
+A Vercel function has no filesystem shared across invocations, so `models.py` was
+rewritten to use Upstash Redis's REST API (the same store Vercel KV provisions) —
+reads `KV_REST_API_URL` / `KV_REST_API_TOKEN`, the exact env var names Vercel injects
+when a KV store is linked to the project. **Status: written, not yet tested** — no
+real Vercel/Upstash account has been set up yet. This blocks running `api/index.py` at
+all right now (`os.environ["KV_REST_API_URL"]` raises if unset). See §7 for the
+recommended unblock (local Upstash-compatible REST shim via Docker, no cloud account
+needed for dev).
 
-All of this lives inside **WSL2 Ubuntu** (not the default `docker-desktop` distro):
+### 2.7 One multi-molecule SDF, not a per-ligand JSON array
+The real product input is one SDF file containing a screening library (matches the
+original problem statement), not a JSON array of individually-specified ligands.
+`docking_worker.split_ligands` uses RDKit's `SDMolSupplier` to split it; each ligand's
+ID comes from its SDF title (`_Name` property) if present, else a positional fallback
+(`ligand_0`, `ligand_1`, ...).
 
-- **Run WSL as root, Ubuntu explicitly:** `wsl.exe -d Ubuntu -u root bash ...`
-  (WSL's OOBE made `kirill` the default user, but everything was built as **root**.)
-- **Python venv:** `~/dockenv` (i.e. `/root/dockenv`). Contains rdkit, numpy, flask,
-  requests, the NVIDIA CUDA runtime wheels, and the Codeplain client deps. Activate with
-  `. ~/dockenv/bin/activate`. Frozen snapshot at repo `requirements-wsl.txt`.
-- **gnina:** `/usr/local/bin/gnina` (v1.3.2, 1.4 GB). It is dynamically linked against
-  CUDA libs it doesn't ship, so **always call it via the wrapper** `~/dockenv/bin/gninaw`,
-  which injects `LD_LIBRARY_PATH` (paths saved in `~/dockenv/gnina_libdirs.txt`). Bare
-  `gnina` fails with missing `.so` errors.
-- **Codeplain client:** `~/plain2code_client`. Render with
-  `python ~/plain2code_client/plain2code.py ...`. Shipped runner scripts live in
-  `~/plain2code_client/test_scripts/` (we use our OWN repo-root runners instead).
-- **GPU:** RTX 3070 Laptop, driver CUDA 12.3. GPU docking works; `--cpu` is the fallback.
-- **API key:** in `.env` at repo root (gitignored). The key was rotated once; the working
-  key is in `.env`. NEVER commit `.env`.
+### 2.8 RDKit only, never OpenBabel
+Explicit, standing instruction — OpenBabel has known issues with hydrogen handling
+during ligand prep. All ligand/receptor prep in this codebase uses RDKit.
 
-Re-create gnina runtime if needed: `scripts/setup_gnina_env.sh` then `scripts/finalize_gnina.sh`.
-Re-create web deps: `scripts/setup_web_deps.sh`.
+## 3. Current file map
 
-## 4a. Native Linux environment (Ali's machine — no WSL, no GPU)
+| File | Role |
+|---|---|
+| `api/index.py` | Control plane (Vercel-deployable FastAPI). `POST /jobs`, `POST /jobs/claim`, `GET /jobs/{id}`, `GET /jobs/{id}/escrow`, `GET /jobs/{id}/result`, `POST /jobs/{id}/worker-callback` |
+| `models.py` | Job + escrow persistence via Upstash REST. **Needs `KV_REST_API_URL`/`KV_REST_API_TOKEN` to run at all** |
+| `worker_daemon.py` | Orchestrator — runs on provider hardware. Polls, runs `docker run <engine-image>` per job, reports back. Deps: `requests` + Docker CLI only |
+| `docking_worker.py` | Engine-agnostic receptor/ligand prep (RDKit). Also gnina-specific `run_gnina`/`parse_best_pose` |
+| `docking_worker_vina.py` | Vina-specific docking (reuses `docking_worker.py`'s prep functions) |
+| `worker_setup.py` | Self-bootstrap for the gnina engine image: installs Python deps, downloads gnina binary if missing, resolves CUDA-compat library paths at call time |
+| `engine_entrypoint.py` / `engine_entrypoint_vina.py` | Per-job container entrypoints: read `/job/job_spec.json`, write `/job/result.json` |
+| `Dockerfile` | gnina engine image (not yet successfully built end-to-end on this machine) |
+| `vina-test/Dockerfile` | Vina engine image (built, tested, working) |
+| `gnina-bin/gnina` | Pre-downloaded gnina binary (gitignored, ~1.4GB) — avoids re-download on every gnina image build |
+| `install_worker.sh` | Intended one-command setup for a provider's machine. **Needs updating** — still describes the earlier single-container daemon model, not the orchestrator+per-job-container model in §2.4 |
+| `docking_marketplace.plain` | Historical Codeplain spec. Not executable, not maintained |
+| `fixtures/` | Real test data: `receptor.pdb` (6LU7), `ligand_active.sdf` (aspirin), `ligand_decoy.sdf` (ethane), `ref_ligand.sdf` |
 
-A second contributor is on native Ubuntu 24.04 with no NVIDIA GPU (Intel iGPU only) and
-~20GB free disk. Fully working as of 2026-06-20:
+## 4. Environment notes (this dev machine: native Ubuntu, no GPU)
 
-- **gnina**: prebuilt `gnina.1.3.2` binary (non-CUDA-bundle variant) downloaded from
-  GitHub releases to `~/.local/bin/gnina`. It still dynamically links `libcudnn.so.9`
-  etc. even for CPU-only runs, so it's never called bare — always via
-  `scripts/gninaw`, which sets `LD_LIBRARY_PATH` to the `nvidia-*-cu12` pip wheels
-  (installed into `.venv` purely for their `.so` files, no actual GPU/driver needed).
-  Run with `--no_gpu`. Verified bit-for-bit consistent with the recorded WSL/GPU smoke
-  result (`fixtures/README.md`): active ligand CNNaffinity 3.820 vs decoy 2.616.
-- **Python**: `python3 -m venv .venv` (needed `sudo apt install python3.12-venv` first —
-  Debian ships Python without `ensurepip`/pip by default). `.venv` has flask, rdkit,
-  numpy, requests, plus the Codeplain client's own deps, plus the nvidia `-cu12` wheels
-  above (~2.5GB combined — only installed for their shared libraries).
-- **Codeplain**: NOT using the cloned `~/plain2code_client` path at all — there's a
-  separate, simpler `codeplain` CLI (`uv tool install codeplain`, v0.3.4) already on
-  PATH with `CODEPLAIN_API_KEY` exported from `~/.bashrc`. `scripts/render.sh` now
-  auto-detects which of the two toolchains (WSL `plain2code_client`+`.env`, or native
-  `codeplain` CLI+env-var key) is present and uses whichever is available — keep it
-  portable when editing.
-- `scripts/gninaw` and the updated `scripts/render.sh` are committed; both dev setups
-  use the same entry points.
+- No NVIDIA GPU (Intel iGPU only). Engines run CPU-only (`--no_gpu` for gnina; Vina has
+  no GPU mode at all).
+- **Disk is the recurring failure mode on this machine** — only ~230GB total, and
+  Docker image builds (especially gnina's CUDA-compat layer, ~2.5GB of pip wheels) can
+  push it to 100% full, which causes severe I/O slowdown (builds that should take
+  minutes take 30-90+ minutes) rather than a clean failure. **Always check `df -h /`
+  and `docker system df` before a build; run `docker builder prune -af` between
+  attempts.** This is a known, repeated lesson, not a one-off.
+- `gnina-bin/gnina` (pre-downloaded binary) and `.venv` exist locally for direct
+  (non-Docker) testing/development; `.venv`'s own copy of the nvidia CUDA-compat
+  wheels was deleted once already to free space — Docker images are now the source of
+  truth for those libraries, not `.venv`.
 
-## 5. The Codeplain workflow (how to build each task)
+## 5. A real bug worth remembering
 
-1. Edit `docking_marketplace.plain` (add to `***definitions***`, `***implementation reqs***`,
-   `***functional specs***` with nested `***acceptance tests***`).
-2. Render: `bash scripts/render.sh docking_marketplace.plain --render-from <N>`
-   (N = first new functionality number; renders N onward incrementally).
-3. Generated code lands in `dist/` (app.py, models.py, requirements.txt, test_app.py).
-   Conformance tests land in `conformance_tests/`. **Both are gitignored** — the `.plain`
-   is the source of truth.
-4. **Render "✓ completed" means unit + conformance tests passed** — that is the
-   correctness gate. If it fails, Codeplain prints a precise error fast.
-5. Optional manual smoke: `scripts/smoke_server.sh` (/health), `scripts/smoke_jobs.sh`
-   (job endpoints). Write similar for new endpoints.
-6. Commit the `.plain` + scripts (not `dist/`).
+The gnina Dockerfile has its **own separate, hardcoded copy** of the nvidia
+CUDA-compat package list (duplicating `worker_setup.GPU_LIB_PACKAGES`), because Docker
+layer caching needs a literal `RUN` command, not a Python function call. When
+`nvidia-nvtx-cu11` (ships `libnvToolsExt.so.1`, which gnina actually needs — `cu12`'s
+nvtx package only ships `libnvtx3interop.so.1`, a different file) was added to fix a
+missing-library bug, it was added to `worker_setup.py` but **not** to the Dockerfile's
+duplicate list — so every rebuild silently reused the cached, still-broken layer for
+~2 hours before the mismatch was caught. **If `worker_setup.GPU_LIB_PACKAGES` ever
+changes again, the Dockerfile's `RUN pip install nvidia-...` list must be updated to
+match, or the fix silently won't apply.**
 
-**Functionality numbering** (the `- Implement :Endpoint:` items under functional specs):
-1 = `GET /health`, 2 = `POST /jobs`, 3 = `GET /jobs/<id>`, 4 = `GET /jobs/<id>/escrow`.
-Task 4 adds functionality 5+.
+## 6. What's actually been verified working
 
-## 6. MISTAKES NOT TO REPEAT (hard-won — read carefully)
+- **Vina engine, full path**: `docker run --rm -v <job_dir>:/job docking-engine-vina:latest`
+  against the real `fixtures/receptor.pdb` + a 2-ligand test SDF (aspirin + ethane,
+  inline `file`/`ligands_sdf` content, not `pdb_id` fetch) → correct result:
+  `ligand_0` (active) `-4.557` kcal/mol vs `ligand_1` (decoy) `-1.466` kcal/mol, correct
+  ranking (more negative = better).
+- **Full loop, current architecture (verified 2026-06-20)**: control plane
+  (`api/index.py`, backed by a local Upstash-compatible REST shim — see §7) +
+  orchestrator (`worker_daemon.py`) + Vina engine container, all running as separate
+  processes/containers. `POST /jobs` → queued → daemon polls `POST /jobs/claim` →
+  spins up a real `docker run docking-engine-vina` per job → container docks against
+  the real local PDB fixture → reports back via `POST /jobs/{id}/worker-callback` →
+  state `docked`, `GET /jobs/{id}/result` returns the correct ranked result
+  (`ligand_0` -4.557 kcal/mol > `ligand_1` -1.466 kcal/mol). Escrow correctly stays
+  `held` (release isn't wired to anything yet — see §8 #4/#5).
+  **Gotcha hit during this test**: a stale `worker_daemon.py` process from before the
+  Docker-per-job rewrite was still running in the background and won the claim race on
+  the first attempt, producing a confusing `gninaw: No such file or directory` error
+  (it was calling the old in-process code path against a deleted local gnina binary).
+  Always check `ps aux | grep worker_daemon` for stale instances before testing.
 
-**Driving WSL from the Bash/PowerShell tools:**
-- Use the **Bash tool** with `MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu -u root bash -c '...'`.
-  `MSYS_NO_PATHCONV=1` stops Git Bash mangling Unix paths.
-- **NEVER pass a multi-line inline script to `wsl bash -c`** — the newlines collapse to
-  spaces and silently break line-oriented scripts (this caused a 25-min hang and a
-  key-load failure). **ALWAYS write a `scripts/*.sh` file and run `bash scripts/x.sh`.**
-- Always `sed -i 's/\r$//'` a script before running (Windows writes CRLF; `.gitattributes`
-  forces LF on `*.sh` but be defensive).
-- Prefer the Bash tool over PowerShell for WSL — PowerShell mis-parses `$null`, pipes,
-  and parens inside the bash string.
+## 7. Recommended next step: local Upstash-compatible shim, then full loop test
 
-**Codeplain `.plain` dialect (THIS client version is strict):**
-- **Only these headings, lowercase, triple-asterisk, no colons:** `***definitions***`,
-  `***implementation reqs***`, `***test reqs***`, `***functional specs***`,
-  `***acceptance tests***` (nested). There is **no "non-functional requirements"** —
-  put framework/language/runtime constraints under `***implementation reqs***`.
-- **Do NOT copy the dialect from the `user-management-api` GitHub repo** (it uses
-  capitalized `***Definitions:***`, `***Non-Functional Requirements:***`). That is an
-  older/incompatible Codeplain version and will throw `Invalid specification heading`.
-- Every `:ColonTerm:` must be defined in `***definitions***` before use.
-- **No cycles in the concept graph.** A definition must not reference a concept that
-  (transitively) references it, and must not reference itself. (We hit this with
-  `:Job:`↔`:JobState:` — fixed by making `:JobState:` standalone.)
-- **Run from the directory containing the `.plain`, by basename.** The file lives at
-  repo root (flat layout, like the official examples). Referencing it as `plain/foo.plain`
-  gives `Module does not exist`.
-
-**Rendering:**
-- An **invalid API key makes the render HANG**, not fail fast. `render.sh` verifies the
-  key length first — keep that guard.
-- Use `--headless` (already in `render.sh`) for non-interactive runs.
-- Renders cost credits and take ~1–3 min per functionality. Render incrementally with
-  `--render-from N`; don't re-render everything.
-
-**Test harness:**
-- Codeplain uses Python's built-in **`unittest`, not pytest** (test files `test_*.py`).
-- The **shipped conformance runner does NOT start a server.** Our repo-root
-  `run_conformance_tests_python.sh` is server-aware (starts `python app.py`, polls
-  `/health`, runs tests, trap-kills). Keep using ours; new server endpoints just work.
-- Internal components (Escrow, Storage) aren't HTTP endpoints, so make them **observable
-  through a real endpoint** to be conformance-testable (e.g. `GET /jobs/<id>/escrow`), or
-  exercise them through the job lifecycle in Task 6.
-
-**gnina (for Task 4):**
-- Call `~/dockenv/bin/gninaw`, never bare `gnina`.
-- Output SDF property tags to parse with RDKit: **`CNNscore`, `CNNaffinity`,
-  `minimizedAffinity`** (Vina, kcal/mol). Higher `CNNaffinity` = better predicted binder.
-- Ligand prep: `obabel -:"<SMILES>" -O out.sdf --gen3d`. Box: `--autobox_ligand ref.sdf`.
-- Verified working: aspirin (active) `CNNaffinity 3.82` > ethane (decoy) `2.62` vs 6LU7.
-- The Codeplain-generated worker shells out to gninaw; because plain2code runs under
-  `dockenv`, the subprocess inherits rdkit + the venv.
-
-## 7. Progress status
-
-**Codeplain dropped 2026-06-20.** After repeated friction rendering Task 4 (a relative-
-path bug in the generated gnina invocation, then a 120s conformance-test timeout from
-real CPU-only docking runs, each costing real render credits to discover) it became
-clear the render loop was slowing down de-risking the actual product logic more than it
-was helping. **Decision: stop using Codeplain entirely, hand-write the backend in
-Python from here on.** This means **giving up eligibility for the Codeplain bounty** —
-accepted tradeoff, not an oversight. `docking_marketplace.plain` is left in the repo as
-a historical design reference (its `:JobSpec:`/`:Job:`/`:Escrow:` shapes are still a
-reasonable contract) but is no longer the executable source of truth and won't be kept
-in sync with the hand-written code going forward.
-
-**Plan revised 2026-06-20** after reconciling against the wider marketplace design
-(separate doc thread): engine stays **gnina**, but the chain layer now moves to *real*
-DeepBook/Walrus calls instead of staying mocked forever, and two confidentiality
-constraints from that design get baked in as acceptance tests rather than left implicit.
-See `docs/superpowers/specs/2026-06-20-docking-vertical-slice-design.md` §2/§4.4/§11 for
-the full rationale. Native-Linux dev environment (no WSL) also now works — see §4a.
-
-| Task | What | Status |
-|---|---|---|
-| 0 | WSL env, gnina GPU runtime, fixtures, smoke, Codeplain mechanics | ✅ done |
-| 1 | Flask `/health` skeleton renders, conformance green | ✅ done |
-| 2 | `:JobSpec:` validation, `:JobState:` machine, SQLite, `POST /jobs` + `GET /jobs/<id>` | ✅ done (smoke-verified) |
-| 3 | `:Escrow:` hold-on-submit + `GET /jobs/<id>/escrow` (JSON ledger, DeepBook stub) | ✅ done (conformance green; not yet manually smoked) |
-| 4 | **Docking worker: gnina build/run/parse/rank** (the scientific core) | ⬜ NEXT |
-| 5 | Proof packager (hash manifest + verify), `:Storage:` interface (still mocked here) | ⬜ |
-| 6 | **Real chain layer:** swap `:Storage:` mock for real Walrus testnet calls (manifest hashes only — never raw protein/ligand/pose bytes); swap `:Escrow:` mock for a thin real DeepBook-backed hold/release/refund (orders carry only opaque compute-unit count + price, never job metadata) | ⬜ |
-| 7 | Full lifecycle wiring against the now-real Escrow/Storage; `GET /jobs/<id>/result` + `/proof` | ⬜ |
-| 8 | *(stretch)* Run the docking worker as a separately-dispatched process/host reachable over HTTP, instead of an in-process call — the first real step toward the actual "idle compute" marketplace claim, which nothing before this task demonstrates | ⬜ |
-
-Note: `:Storage:` (Walrus stand-in) was intentionally deferred from Task 3 to Task 5,
-where it is actually used (storing proofs) and therefore testable. It stays mocked
-through Task 5 and only becomes real Walrus in Task 6, once the manifest shape (and the
-constraint on what's allowed to ever touch it) is locked down.
-
-**Known gap, accepted for now:** through Task 7, the "idle compute marketplace" premise
-isn't actually demonstrated — the worker runs in-process on the same machine as the API.
-Task 8 is the (stretch) fix. If time runs out before Task 8, be explicit in the demo that
-this slice proves *verifiable docking + real settlement*, not yet *multi-party compute
-matching*.
-
-**New backend dependency from the frontend design:** Kirill's frontend needs a
-`POST /jobs/estimate` endpoint (job-spec-shaped input, returns a cost estimate, no escrow
-hold, no job created) that isn't in any task above yet — add it to the `.plain` spec
-alongside Task 2 (it only needs `:JobSpec:` validation, not the state machine) before the
-frontend needs to integrate against it. See the frontend design doc §2 for the exact
-shape.
-
-## 8. Doing Task 4 next (guidance, not gospel)
-
-The worker docks each ligand with gnina and returns a ranked `DockResult`
-(`ligand_id, cnn_score, cnn_affinity, vina_affinity, pose_path`). Open design question
-for the next session: Codeplain validates via HTTP, but docking is slow and currently
-`POST /jobs` just queues. Options:
-- (a) Add a synchronous endpoint (e.g. `POST /jobs/<id>/run`) that docks and returns the
-  result, testable directly via conformance; then Task 6 makes it async/automatic. OR
-- (b) Fold the worker into the Task 6 lifecycle and test end-to-end via
-  `GET /jobs/<id>/result` after submission.
-Recommended: (a) — keeps Task 4 independently testable. Use the committed fixtures
-(`fixtures/receptor.pdb`, `fixtures/ref_ligand.sdf`, `fixtures/ligand_active.sdf`,
-`fixtures/ligand_decoy.sdf`). Acceptance tests must assert a **numeric** `cnn_affinity`
-and that the **active ligand outranks the decoy** (verified true: 3.82 > 2.62). Make the
-generated worker call `~/dockenv/bin/gninaw` and keep docking small (num_modes 5,
-exhaustiveness 8) so conformance stays under the timeout.
-
-## 9. Key files
-
-- `docking_marketplace.plain` — THE spec (source of truth; grows per task).
-- `config.yaml`, `run_unittests_python.sh`, `run_conformance_tests_python.sh` — Codeplain harness.
-- `scripts/render.sh` — render helper (loads .env, verifies key, renders headless).
-- `scripts/setup_gnina_env.sh`, `finalize_gnina.sh`, `setup_web_deps.sh` — env (re)build.
-- `scripts/smoke_server.sh`, `smoke_jobs.sh`, `fixtures_and_smoke.sh` — manual smokes.
-- `fixtures/` — toolchain test fixtures (6LU7 Mpro + ligands) + `sample_job.json`.
-- `dist/` (gitignored) — latest generated app.
-- `.env` (gitignored) — `CODEPLAIN_API_KEY`.
-
-## 10. Resume in one minute
+To unblock testing `api/index.py` without a real Vercel/Upstash account, run a local
+REST-compatible shim (`hiett/serverless-redis-http`, a small proxy in front of a plain
+`redis` container that speaks the exact same REST protocol Upstash/Vercel KV use):
 
 ```bash
-# from the Bash tool (Git Bash), all WSL work as root/Ubuntu via script files:
-MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu -u root bash -c \
-  "cd /mnt/c/Users/Kirill/Encode-Hackathon && . ~/dockenv/bin/activate && \
-   ~/dockenv/bin/gninaw --version && python ~/plain2code_client/plain2code.py --version"
-# then edit docking_marketplace.plain, and:
-#   bash scripts/render.sh docking_marketplace.plain --render-from 5
+docker run -d --name local-redis redis:7-alpine
+docker run -d --name local-redis-http -p 8079:80 \
+  -e SRH_MODE=env -e SRH_TOKEN=local-dev-token \
+  -e SRH_CONNECTION_STRING="redis://local-redis:6379" \
+  --link local-redis hiett/serverless-redis-http:latest
+export KV_REST_API_URL=http://localhost:8079
+export KV_REST_API_TOKEN=local-dev-token
 ```
+
+Same env var names as production — swapping to real Vercel KV later is just changing
+the URL/token, no code change. Then run `api/index.py` + `worker_daemon.py`
+(`ENGINE_IMAGE=docking-engine-vina:latest`) together and submit a real job, end to end,
+through the actual claim/Docker/callback path (not a direct `docker run` test like §6).
+
+## 8. Remaining work (roughly in priority order)
+
+1. ~~Verify the full loop end to end~~ — **done 2026-06-20, see §6.**
+2. Finish building + verifying the gnina engine image (the real target engine) once
+   disk space allows — Dockerfile is believed correct (§5's fix applied), just needs an
+   uninterrupted build.
+3. Update `install_worker.sh` to match the orchestrator+per-job-container model (§2.4)
+   instead of the older single-container daemon description.
+4. Proof/verification step (tamper-evident hash manifest) — not built at all yet.
+   Needed for "researcher verifies the job ran correctly" in the product flow (§1).
+5. Real Sui payment (researcher pays, provider gets paid) — `escrow_hold`/
+   `escrow_release`/`escrow_refund` exist in `models.py` but are pure bookkeeping, no
+   real blockchain calls. DeepBook/Walrus integration per the original design spec's
+   confidentiality constraints (§11 of the design spec doc) still applies once this is
+   built: never put job-identifying data on-chain or in a public Walrus blob.
+6. Hardware registration on signup (`POST /workers/register` or similar) — not built.
+   Currently any daemon with any `WORKER_ID` can claim any job; no capability matching.
+7. `POST /jobs/estimate` (cost estimate before payment) — needed by the frontend
+   (Kirill's design doc), not built yet.
+8. Notification to researcher on job completion — not built; likely frontend/email
+   territory, not backend.
+
+## 9. Real production deployment (2026-06-20)
+
+The control plane is **actually deployed**, not just locally tested:
+- Vercel project: `encode-hackathon/encode_hackathon`, logged in as `alirp366-8280`.
+- Storage: real Upstash Redis provisioned via Vercel's marketplace integration
+  (`vercel integration add upstash/upstash-kv`) — injects `KV_REST_API_URL`/
+  `KV_REST_API_TOKEN` automatically, exactly the names `models.py` already expects, so
+  no code change was needed going from the local shim (§7) to real production storage.
+- Production URL: **https://encodehackathon-dusky.vercel.app**
+- `.vercelignore` added — only `api/`, `models.py`, `requirements.txt` actually deploy.
+  Without it, the first deploy attempt tried to upload 1.3GB (the gnina binary, `.venv`,
+  fixtures, etc.) and failed Vercel's 100MB limit. Worker-side files
+  (`docking_worker*.py`, `worker_*.py`, `engine_entrypoint*.py`, `Dockerfile`) never
+  belong in this deployment — they run on provider hardware, not Vercel.
+- **Verified end-to-end against the real deployment**: local `worker_daemon.py`
+  (`CONTROL_PLANE_URL=https://encodehackathon-dusky.vercel.app`) polled the real
+  production API, claimed a real job, ran it in the Vina engine container, reported
+  back, and `GET .../jobs/{id}/result` from the live URL returned the correct ranked
+  result. This is the actual target architecture working for real, not a local stand-in.
+- `.env.local` (gitignored) has the real Upstash credentials for local testing against
+  production storage if needed; `vercel env pull` re-fetches it if missing.
+
+## 10. Local dev quick-start (the loop verified in §6, also runnable against prod — §9)
+
+```bash
+# Option A: local Upstash-compatible shim (no cloud account needed)
+docker run -d --name local-redis redis:7-alpine
+docker run -d --name local-redis-http -p 8079:80 \
+  -e SRH_MODE=env -e SRH_TOKEN=local-dev-token \
+  -e SRH_CONNECTION_STRING="redis://local-redis:6379" \
+  --link local-redis hiett/serverless-redis-http:latest
+export KV_REST_API_URL=http://localhost:8079 KV_REST_API_TOKEN=local-dev-token
+
+# Option B: real production storage (credentials in .env.local, gitignored)
+# set -a; . .env.local; set +a
+
+cd /home/ali/Projects/encode_hackathon && . .venv/bin/activate
+python api/index.py &   # port 8000 -- or just use https://encodehackathon-dusky.vercel.app directly
+
+# orchestrator (check for stale instances first! ps aux | grep worker_daemon)
+export ENGINE_IMAGE=docking-engine-vina:latest WORKER_ID=test-node-1 \
+       CONTROL_PLANE_URL=http://localhost:8000  # or the prod URL
+python worker_daemon.py &
+
+# submit a job (use a real JobSpec with inline file/ligands_sdf content, see /tmp/test_job.json pattern)
+curl -X POST http://localhost:8000/jobs -H 'content-type: application/json' -d @some_job.json
+```
+
+## 11. Frontend dependency
+
+Kirill's frontend needs `POST /jobs/estimate` (see `docs/superpowers/specs/2026-06-20-frontend-job-submission-design.md`
+§2) — flagged here so it doesn't get missed when picking up backend work.

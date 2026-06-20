@@ -7,25 +7,26 @@ library), not a list of individually-specified ligands.
 import os
 import subprocess
 
-import requests
 from rdkit import Chem
 from rdkit.Chem import AllChem
+
+import worker_setup
 
 RCSB_PDB_URL = "https://files.rcsb.org/download/{pdb_id}.pdb"
 
 
-def has_gpu() -> bool:
-    """Detects an NVIDIA GPU via nvidia-smi; CPU fallback otherwise."""
-    try:
-        subprocess.run(["nvidia-smi"], check=True, capture_output=True)
-        return True
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return False
-
-
 def prepare_receptor(receptor_spec: dict, work_dir: str) -> str:
-    """:ReceptorPrep: -- fetch-by-id or use inline content, then strip to ATOM records."""
+    """:ReceptorPrep: -- fetch-by-id or use inline content, then strip to ATOM records.
+
+    `requests` is imported lazily here, not at module level, because the common case
+    in this marketplace is the client/researcher provides the PDB file directly
+    (per the product design -- see SESSION_HANDOFF.md), so engines that never use the
+    pdb_id-fetch path (e.g. the lightweight Vina test image) don't need this dependency
+    installed at all.
+    """
     if receptor_spec.get("pdb_id"):
+        import requests
+
         resp = requests.get(RCSB_PDB_URL.format(pdb_id=receptor_spec["pdb_id"]), timeout=30)
         resp.raise_for_status()
         pdb_text = resp.text
@@ -81,8 +82,10 @@ def split_ligands(ligands_sdf: str, work_dir: str) -> list[dict]:
 
 
 def run_gnina(receptor_path: str, ligand_path: str, box_spec: dict, params: dict, output_path: str) -> None:
-    """:GninaCommand: -- invoke gninaw (PATH-resolved, never bare gnina, never a relative path)."""
-    cmd = ["gninaw", "-r", receptor_path, "-l", ligand_path, "-o", output_path]
+    """:GninaCommand: -- invoke the gnina binary worker_setup resolved, with the dynamic-
+    library environment it computed (never a relative path or a PATH-resolved wrapper
+    script, since that broke once before under a different caller cwd)."""
+    cmd = [worker_setup.GNINA_PATH, "-r", receptor_path, "-l", ligand_path, "-o", output_path]
 
     if box_spec.get("autobox_ligand"):
         ref_path = output_path + ".autobox_ref.sdf"
@@ -101,10 +104,10 @@ def run_gnina(receptor_path: str, ligand_path: str, box_spec: dict, params: dict
         "--num_modes", str(params["num_modes"]),
         "--exhaustiveness", str(params["exhaustiveness"]),
     ]
-    if not has_gpu():
+    if not worker_setup.has_gpu():
         cmd.append("--no_gpu")
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, env=worker_setup.get_gnina_env())
     if result.returncode != 0:
         raise RuntimeError(f"gnina failed: {result.stderr.strip()}")
 

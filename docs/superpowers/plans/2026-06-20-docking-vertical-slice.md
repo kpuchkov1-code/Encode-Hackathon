@@ -1,5 +1,12 @@
 # Docking Vertical Slice Implementation Plan
 
+> **SUPERSEDED 2026-06-20 — read `SESSION_HANDOFF.md` instead.** This entire plan
+> assumes Codeplain authorship and an in-process WSL2 worker, both abandoned. Codeplain
+> was dropped (render-loop friction); the worker now runs in per-job Docker containers
+> via a separate orchestrator (`worker_daemon.py`), not in-process. Kept below as a
+> historical record of the original task breakdown only — do not follow it as
+> instructions. `SESSION_HANDOFF.md` §8 has the current, accurate remaining-work list.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build an end-to-end docking slice where a submitted job is really docked by gnina on the GPU, a tamper-evident proof is produced, and a mocked escrow releases payment against that proof — authored primarily in Codeplain `.plain` specs.
