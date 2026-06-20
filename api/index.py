@@ -25,6 +25,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field, model_validator
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import deepbook_oracle  # noqa: E402
 import models  # noqa: E402
 import walrus  # noqa: E402
 
@@ -201,8 +202,21 @@ def sample_ligands_for_verification(ligands_sdf: str, fraction: float, seed_text
     return "".join(blocks[i] for i in chosen)
 
 
+def _baseline_rate_per_ligand() -> tuple[float, dict | None]:
+    """The per-ligand rate to charge, plus the live-market context it came from (or None).
+
+    Falls back to the static PRICE_PER_LIGAND_AT_BASELINE whenever the DeepBook oracle is
+    unavailable (e.g. on Vercel, where the Node bridge isn't deployed) -- pricing must never
+    depend on the order book being reachable, same best-effort contract as Walrus."""
+    market = deepbook_oracle.live_market(PRICE_PER_LIGAND_AT_BASELINE)
+    if market:
+        return market["price_per_ligand"], market
+    return PRICE_PER_LIGAND_AT_BASELINE, None
+
+
 def estimate_price(num_ligands: int, exhaustiveness: int) -> float:
-    price = PRICE_PER_LIGAND_AT_BASELINE * num_ligands * (exhaustiveness / BASELINE_EXHAUSTIVENESS)
+    rate, _ = _baseline_rate_per_ligand()
+    price = rate * num_ligands * (exhaustiveness / BASELINE_EXHAUSTIVENESS)
     return round(max(price, MIN_PRICE), 2)
 
 
@@ -316,8 +330,22 @@ def estimate_job(job_spec: JobSpec) -> dict:
     """Dry-run pricing -- no job is created. Needed by the frontend (Kirill's
     workstream) to show a price before the researcher commits to anything."""
     num_ligands = count_ligands(job_spec.ligands_sdf)
-    price = estimate_price(num_ligands, job_spec.params.exhaustiveness)
-    return {"price": price, "num_ligands": num_ligands}
+    rate, market = _baseline_rate_per_ligand()
+    price = round(max(rate * num_ligands * (job_spec.params.exhaustiveness / BASELINE_EXHAUSTIVENESS), MIN_PRICE), 2)
+    out = {"price": price, "num_ligands": num_ligands}
+    if market:
+        # Provenance so the UI can show the price came from a live DeepBook order book.
+        out["pricing"] = {
+            "source": "deepbook",
+            "pool_key": market["pool_key"],
+            "pool_id": market["pool_id"],
+            "sui_per_compute_unit": market["sui_per_compute_unit"],
+            "rate_per_ligand": rate,
+            "note": market["note"],
+        }
+    else:
+        out["pricing"] = {"source": "baseline", "rate_per_ligand": rate}
+    return out
 
 
 @app.post("/jobs", status_code=202)
@@ -606,6 +634,27 @@ def _suiscan(kind: str, ident: str) -> str:
     """Public Suiscan testnet explorer link -- lets anyone independently verify the
     escrow movement on-chain. kind is 'tx' or 'object'."""
     return f"https://suiscan.xyz/testnet/{kind}/{ident}"
+
+
+def _pricing_badge_html(market: dict | None) -> str:
+    """Show that the quoted price came from a live DeepBook order book (with a Suiscan link
+    to the pool anyone can inspect), or nothing when the oracle is unavailable and the static
+    baseline rate was used -- so deploys without the Node bridge look unchanged."""
+    if not market:
+        return ""
+    pool_id = market.get("pool_id")
+    pool_link = (
+        f'<a href="{_suiscan("object", pool_id)}">{market.get("pool_key")}</a>'
+        if pool_id else (market.get("pool_key") or "")
+    )
+    rate = market.get("sui_per_compute_unit")
+    note = market.get("note") or ""
+    return (
+        '<p class="lede" style="font-size:0.9em;opacity:0.85">'
+        f'⛓ Priced from the live DeepBook pool {pool_link} '
+        f'(best compute rate {rate:g} SUI/unit). '
+        f'<span class="hint">{note}</span></p>'
+    )
 
 
 def _escrow_chain_html(job_id: str) -> str:
@@ -1201,6 +1250,8 @@ async def researchers_submit_handler(
     created = submit_job(job_spec)
     job_id, price = created["job_id"], created["price"]
     num_ligands = created.get("num_ligands", count_ligands(ligands_sdf))
+    _rate, market = _baseline_rate_per_ligand()
+    pricing_badge = _pricing_badge_html(market)
     if models.SUI_ONCHAIN:
         # Real on-chain settlement: send the researcher to the wallet-connect pay page,
         # where their own wallet signs the escrow lock. The job queues only after that.
@@ -1221,6 +1272,7 @@ async def researchers_submit_handler(
     <div class="card">
       <p class="lede">{num_ligands} ligand(s) detected.</p>
       <p class="price">${price}</p>
+      {pricing_badge}
       {action}
     </div>
     <p class="lede">Job ID: <code>{job_id}</code></p>

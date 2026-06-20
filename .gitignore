@@ -23,3 +23,7 @@ dist/
 # Sui bridge: never commit deps, the compiled Move artifacts, or any platform key/env
 sui-bridge/node_modules/
 move/escrow/build/
+# DeepBook bridge (isolated @mysten/sui v2 deps) + compiled COMPUTE token artifacts
+deepbook-bridge/node_modules/
+deepbook-bridge/pool.json
+move/compute_token/build/

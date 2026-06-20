@@ -1,0 +1,11 @@
+{
+  "name": "deepbook-bridge",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "description": "Isolated DeepBook v3 bridge (needs @mysten/sui v2, kept separate from the v1 escrow bridge).",
+  "dependencies": {
+    "@mysten/deepbook-v3": "^1.5.1",
+    "@mysten/sui": "^2.19.0"
+  }
+}
