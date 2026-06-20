@@ -36,6 +36,80 @@ SUI_BRIDGE_SECRET = os.environ.get("SUI_BRIDGE_SECRET", "")
 MIST_PER_PRICE_UNIT = int(os.environ.get("MIST_PER_PRICE_UNIT", "1000000"))
 SUI_ONCHAIN = bool(SUI_BRIDGE_URL or SUI_BRIDGE_CMD)
 
+# Public, key-free chain config. The escrow package/module/arbiter/network are all on-chain
+# PUBLIC facts -- serving them (and reading the escrow object) needs no platform key and no
+# bridge. Defaults are the deployed testnet values so the wallet-connect + lock flow keeps
+# working even when the (flaky) signing bridge is momentarily unreachable; the bridge is then
+# only on the critical path for release/refund, which genuinely need the platform key. Env
+# overrides exist for a future redeploy to a different package/arbiter.
+SUI_FULLNODE_URL = os.environ.get("SUI_FULLNODE_URL", "https://fullnode.testnet.sui.io:443")
+ESCROW_PACKAGE_ID = os.environ.get(
+    "ESCROW_PACKAGE_ID",
+    "0x6d6321b8f9e54976a2ad150690fb949eae50b388c231d64a5db34cc1172dc56c",
+)
+ESCROW_MODULE = os.environ.get("ESCROW_MODULE", "escrow")
+ESCROW_ARBITER = os.environ.get(
+    "ESCROW_ARBITER",
+    "0xbfc2f7d32e0b2df8a086fcbe30d394cd4d60b638ae3b53fa7329747a741de072",
+)
+SUI_NETWORK_NAME = os.environ.get("SUI_NETWORK", "testnet")
+
+
+def _chain_config() -> dict:
+    """Static public config the frontend needs to build a lock tx -- no bridge, no key."""
+    return {
+        "packageId": ESCROW_PACKAGE_ID,
+        "module": ESCROW_MODULE,
+        "arbiter": ESCROW_ARBITER,
+        "network": SUI_NETWORK_NAME,
+    }
+
+
+def _sui_rpc(method: str, params: list) -> dict:
+    resp = requests.post(
+        SUI_FULLNODE_URL,
+        json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if "error" in data:
+        raise RuntimeError(f"sui rpc {method} error: {data['error']}")
+    return data["result"]
+
+
+def _inspect_escrow(escrow_object_id: str) -> dict:
+    """Read the shared Escrow object straight from a public fullnode -- read-only, no key,
+    no bridge. Mirrors the bridge's inspect() field parsing so lock verification is identical."""
+    result = _sui_rpc("sui_getObject", [escrow_object_id, {"showContent": True, "showType": True}])
+    data = result.get("data")
+    if not data:
+        raise RuntimeError(f"escrow object not found: {escrow_object_id}")
+    content = data.get("content") or {}
+    if content.get("dataType") != "moveObject":
+        raise RuntimeError(f"not a move object: {escrow_object_id}")
+    obj_type = content.get("type") or data.get("type") or ""
+    expected = f"{ESCROW_PACKAGE_ID}::{ESCROW_MODULE}::Escrow"
+    if not obj_type.startswith(expected):
+        raise RuntimeError(f"wrong object type: {obj_type} (expected {expected})")
+    fields = content.get("fields") or {}
+    funds = fields.get("funds")
+    amount_mist = None
+    if funds is not None:
+        amount_mist = str(funds["fields"]["value"]) if isinstance(funds, dict) and funds.get("fields") else str(funds)
+    job_id_raw = fields.get("job_id")
+    if isinstance(job_id_raw, list):
+        job_id = bytes(job_id_raw).decode("utf-8", "replace")
+    else:
+        job_id = job_id_raw
+    return {
+        "escrowObjectId": escrow_object_id,
+        "jobId": job_id,
+        "payer": fields.get("payer"),
+        "arbiter": fields.get("arbiter"),
+        "amountMist": amount_mist,
+    }
+
 
 def _sui(op: str, payload: dict) -> dict:
     """Invoke one escrow operation on the signing bridge. Raises on any bridge error so
@@ -167,7 +241,7 @@ def chain_info() -> dict | None:
     None when off-chain (no wallet flow)."""
     if not SUI_ONCHAIN:
         return None
-    return _sui("info", {})
+    return _chain_config()
 
 
 def payment_intent(job_id: str) -> dict | None:
@@ -203,8 +277,8 @@ def record_escrow_lock(job_id: str, escrow_object_id: str) -> dict:
         raise ValueError("job not found")
     if record["state"] != "pending_payment":
         raise ValueError(f"job is not awaiting payment (state={record['state']})")
-    info = _sui("info", {})
-    onchain = _sui("inspect", {"escrowObjectId": escrow_object_id})
+    info = _chain_config()
+    onchain = _inspect_escrow(escrow_object_id)
     if onchain.get("jobId") != job_id:
         raise ValueError("on-chain escrow is for a different job")
     if (onchain.get("arbiter") or "").lower() != info["arbiter"].lower():
