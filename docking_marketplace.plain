@@ -1,0 +1,29 @@
+***definitions***
+
+- :App: is a Python application that provides a REST API for a decentralized molecular docking marketplace. :App: accepts docking jobs, runs them with the gnina binary, produces a verifiable proof of execution, and settles payment through a mock escrow. :App: should run on port 8000 and is started by running `python app.py`.
+
+- :Endpoint: is an HTTP endpoint of :App:.
+
+***implementation reqs***
+
+- :App: should be implemented in Python (version 3.11 or newer) using the Flask framework.
+
+- The main executable file of :App: should be called "app.py". Running `python app.py` should start the Flask server listening on host 0.0.0.0 and port 8000.
+
+- :App: should declare its Python dependencies in a "requirements.txt" file.
+
+- JSON keys in request and response bodies should use snake_case.
+
+***test reqs***
+
+- Conformance tests should make HTTP requests to :App:, assuming :App: is already running and accessible at "http://localhost:8000".
+
+***functional specs***
+
+- Implement :Endpoint: "GET /health" that returns HTTP status 200 with the JSON response body `{"status": "ok"}`.
+
+  ***acceptance tests***
+
+  - A GET request to "/health" returns HTTP status 200.
+
+  - The response body of a GET request to "/health" equals the JSON object `{"status": "ok"}`.

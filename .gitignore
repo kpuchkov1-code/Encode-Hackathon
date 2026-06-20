@@ -6,3 +6,11 @@ fixtures/out_*.sdf
 fixtures/gnina_*.log
 # rendered Codeplain output (kept out of source; .plain is the source of truth)
 build/
+plain_modules/
+python_plain_modules/
+conformance_tests/
+python_build/
+python_*/
+codeplain.log
+unittests/
+dist/
