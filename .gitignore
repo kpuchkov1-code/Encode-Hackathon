@@ -20,3 +20,6 @@ unittests/
 dist/
 .vercel
 .env*
+# Sui bridge: never commit deps, the compiled Move artifacts, or any platform key/env
+sui-bridge/node_modules/
+move/escrow/build/

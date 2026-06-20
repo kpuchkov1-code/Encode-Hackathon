@@ -22,6 +22,52 @@ import requests
 KV_REST_API_URL = os.environ["KV_REST_API_URL"]
 KV_REST_API_TOKEN = os.environ["KV_REST_API_TOKEN"]
 
+# --- Sui on-chain escrow (opt-in) -------------------------------------------------
+# The escrow ledger is real on Sui testnet when a bridge is configured, otherwise it
+# stays the pure-KV mock below so local dev / unconfigured deploys keep working. Two
+# transports: SUI_BRIDGE_URL (the bridge deployed as its own HTTP service, for Vercel)
+# or SUI_BRIDGE_CMD (run the bridge CLI as a subprocess, for local dev). Whichever is
+# set holds the platform key + package id on the bridge side -- never here.
+SUI_BRIDGE_URL = os.environ.get("SUI_BRIDGE_URL")           # e.g. https://sui-bridge.example.com
+SUI_BRIDGE_CMD = os.environ.get("SUI_BRIDGE_CMD")           # e.g. "node /path/sui-bridge/cli.mjs"
+SUI_BRIDGE_SECRET = os.environ.get("SUI_BRIDGE_SECRET", "")
+# Maps an abstract price unit (the "$" the pricing logic computes) to on-chain MIST.
+# Default: 1 price unit = 0.001 SUI, deliberately tiny so testnet funds last.
+MIST_PER_PRICE_UNIT = int(os.environ.get("MIST_PER_PRICE_UNIT", "1000000"))
+SUI_ONCHAIN = bool(SUI_BRIDGE_URL or SUI_BRIDGE_CMD)
+
+
+def _sui(op: str, payload: dict) -> dict:
+    """Invoke one escrow operation on the signing bridge. Raises on any bridge error so
+    callers never silently treat a failed on-chain move as success."""
+    if SUI_BRIDGE_URL:
+        resp = requests.post(
+            f"{SUI_BRIDGE_URL.rstrip('/')}/{op}",
+            json=payload,
+            headers={"x-bridge-secret": SUI_BRIDGE_SECRET},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    else:  # subprocess CLI form (local dev)
+        import shlex
+        import subprocess
+
+        arg_order = {
+            "address": [],
+            "lock": ["jobId", "amountMist"],
+            "release": ["escrowObjectId", "providerAddress"],
+            "refund": ["escrowObjectId"],
+        }[op]
+        cmd = shlex.split(SUI_BRIDGE_CMD) + [op] + [str(payload[k]) for k in arg_order]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        data = json.loads(proc.stdout.strip().splitlines()[-1]) if proc.stdout.strip() else {}
+        if proc.returncode != 0 and "error" not in data:
+            raise RuntimeError(f"sui bridge {op} failed: {proc.stderr.strip()[:500]}")
+    if "error" in data:
+        raise RuntimeError(f"sui bridge {op} error: {data['error']}")
+    return data
+
 VALID_STATES = {"pending_payment", "queued", "running", "docked", "proven", "settled", "failed"}
 
 JOB_KEY = "job:{job_id}"
@@ -185,16 +231,36 @@ def update_job(job_id: str, *, state: str | None = None, reason: str | None = No
 
 def escrow_hold(job_id: str, amount: float, supplier_id: str) -> None:
     record = {"state": "held", "amount": amount, "supplier_id": supplier_id}
+    if SUI_ONCHAIN:
+        amount_mist = int(round(amount * MIST_PER_PRICE_UNIT))
+        locked = _sui("lock", {"jobId": job_id, "amountMist": amount_mist})
+        record["chain"] = {
+            "network": "sui-testnet",
+            "amount_mist": amount_mist,
+            "escrow_object_id": locked.get("escrowObjectId"),
+            "lock_digest": locked.get("digest"),
+        }
     _cmd("SET", ESCROW_KEY.format(job_id=job_id), json.dumps(record))
 
 
-def escrow_release(job_id: str, proof) -> bool:
-    """Releases held escrow only against a non-empty proof. Returns False (no-op) otherwise."""
+def escrow_release(job_id: str, proof, *, provider_address: str | None = None) -> bool:
+    """Releases held escrow only against a non-empty proof. Returns False (no-op)
+    otherwise. When on-chain and the paid worker has a Sui address, this is a real SUI
+    transfer to that address; the resulting tx digest is recorded on the escrow."""
     if not proof:
         return False
     record = escrow_status(job_id)
     if record is None or record["state"] != "held":
         return False
+    chain = record.get("chain")
+    if SUI_ONCHAIN and chain and chain.get("escrow_object_id") and provider_address:
+        released = _sui("release", {
+            "escrowObjectId": chain["escrow_object_id"],
+            "providerAddress": provider_address,
+        })
+        chain["release_digest"] = released.get("digest")
+        chain["paid_to"] = provider_address
+        record["chain"] = chain
     record["state"] = "released"
     _cmd("SET", ESCROW_KEY.format(job_id=job_id), json.dumps(record))
     return True
@@ -202,9 +268,15 @@ def escrow_release(job_id: str, proof) -> bool:
 
 def escrow_refund(job_id: str) -> None:
     record = escrow_status(job_id)
-    if record is not None:
-        record["state"] = "refunded"
-        _cmd("SET", ESCROW_KEY.format(job_id=job_id), json.dumps(record))
+    if record is None:
+        return
+    chain = record.get("chain")
+    if SUI_ONCHAIN and chain and chain.get("escrow_object_id") and "refund_digest" not in chain:
+        refunded = _sui("refund", {"escrowObjectId": chain["escrow_object_id"]})
+        chain["refund_digest"] = refunded.get("digest")
+        record["chain"] = chain
+    record["state"] = "refunded"
+    _cmd("SET", ESCROW_KEY.format(job_id=job_id), json.dumps(record))
 
 
 def escrow_status(job_id: str) -> dict | None:
@@ -215,17 +287,22 @@ def escrow_status(job_id: str) -> dict | None:
 HEARTBEAT_TIMEOUT_SECONDS = 15  # daemon polls every ~3s; several missed polls = offline
 
 
-def create_worker_identity() -> dict:
+def create_worker_identity(sui_address: str = "") -> dict:
     """Issues a brand-new worker_id + secret token at signup. The token must be
     presented on every subsequent request made as this worker (registering detected
     hardware, claiming jobs) -- this is what actually prevents two different people
     from colliding on or impersonating the same worker_id, not just a free-text name
-    anyone could type in. Returned once, here; never echoed back afterwards."""
+    anyone could type in. Returned once, here; never echoed back afterwards.
+
+    `sui_address` is where this provider gets paid: on a verified job the platform
+    releases the on-chain escrow directly to it. Optional (a provider can run without
+    one and just not receive real payouts yet)."""
     worker_id = f"worker-{uuid.uuid4().hex[:12]}"
     token = secrets.token_urlsafe(24)
     record = {
         "worker_id": worker_id,
         "token": token,
+        "sui_address": sui_address.strip(),
         "hardware_info": "(pending -- starts once the daemon runs and detects it)",
         "registered_at": datetime.now(timezone.utc).isoformat(),
         "last_seen": None,

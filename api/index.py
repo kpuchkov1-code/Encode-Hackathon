@@ -378,7 +378,34 @@ def get_job_page(job_id: str) -> str:
     else:
         body += "<p class=\"lede\">Refresh this page to check progress.</p>"
     body += "</div>"
+    body += _escrow_chain_html(job_id)
     return page(f"Job {job_id[:8]}", body)
+
+
+def _suiscan(kind: str, ident: str) -> str:
+    """Public Suiscan testnet explorer link -- lets anyone independently verify the
+    escrow movement on-chain. kind is 'tx' or 'object'."""
+    return f"https://suiscan.xyz/testnet/{kind}/{ident}"
+
+
+def _escrow_chain_html(job_id: str) -> str:
+    """Render the on-chain escrow trail (lock/release/refund tx digests + escrow object)
+    as Suiscan links, when the job's escrow was settled on Sui. Renders nothing for
+    mock (off-chain) escrow so unconfigured deploys look unchanged."""
+    escrow = models.escrow_status(job_id)
+    chain = (escrow or {}).get("chain")
+    if not chain:
+        return ""
+    sui = f"{chain.get('amount_mist', 0) / 1_000_000_000:.4f} SUI"
+    rows = [f"<p><strong>Escrow on Sui testnet:</strong> {sui}</p>"]
+    if chain.get("escrow_object_id"):
+        rows.append(f'<p>Escrow object: <a href="{_suiscan("object", chain["escrow_object_id"])}">{chain["escrow_object_id"][:18]}…</a></p>')
+    for label, key in (("Lock", "lock_digest"), ("Release", "release_digest"), ("Refund", "refund_digest")):
+        if chain.get(key):
+            rows.append(f'<p>{label} tx: <a href="{_suiscan("tx", chain[key])}">{chain[key][:18]}…</a></p>')
+    if chain.get("paid_to"):
+        rows.append(f'<p>Paid to provider: <a href="{_suiscan("object", chain["paid_to"])}">{chain["paid_to"][:18]}…</a></p>')
+    return '<div class="card">' + "".join(rows) + "</div>"
 
 
 class WorkerCallback(BaseModel):
@@ -412,7 +439,14 @@ def worker_callback(job_id: str, callback: WorkerCallback) -> dict:
     # current state, but payment release must still actually happen on success, which
     # it didn't before this fix: escrow was held on confirm and then never touched
     # again, so every successful job left it stuck "held" forever.
-    released = models.escrow_release(job_id, proof=True)
+    # Pay out to the address the claiming provider registered (if any) -- that's who
+    # actually did the compute. With no address on file the release still settles the
+    # job but stays a mock (no real on-chain transfer to nowhere).
+    provider_address = None
+    if job.get("claimed_by"):
+        worker = models.get_worker(job["claimed_by"])
+        provider_address = (worker or {}).get("sui_address") or None
+    released = models.escrow_release(job_id, proof=True, provider_address=provider_address)
     if released:
         models.update_job(job_id, state="settled")
         if job.get("claimed_by"):
@@ -464,6 +498,10 @@ def providers_signup_form() -> str:
     ever collide on or impersonate the same identity.</p>
     <div class="card">
       <form method="post" action="/providers/signup">
+        <label>Sui payout address (testnet) &mdash; where you get paid when a job you
+        run is verified. Starts with <code>0x</code>. Optional, but without it you
+        won't receive real payouts.</label>
+        <input type="text" name="sui_address" placeholder="0x..." style="width:100%;margin:8px 0 16px">
         <button type="submit">Sign up</button>
       </form>
     </div>
@@ -471,8 +509,8 @@ def providers_signup_form() -> str:
 
 
 @app.post("/providers/signup", response_class=HTMLResponse)
-def providers_signup_submit(request: Request) -> str:
-    identity = models.create_worker_identity()
+def providers_signup_submit(request: Request, sui_address: str = Form("")) -> str:
+    identity = models.create_worker_identity(sui_address=sui_address)
     worker_id, token = identity["worker_id"], identity["token"]
     base_url = str(request.base_url).rstrip("/")
     run_cmd = f"CONTROL_PLANE_URL={base_url} WORKER_ID={worker_id} WORKER_TOKEN={token} ./install_worker.sh"
@@ -520,6 +558,7 @@ def get_worker_page(worker_id: str) -> str:
     <h1>{worker_id} {badge}</h1>
     <div class="card">
       <p><strong>Hardware:</strong> {worker.get("hardware_info", "unknown")}</p>
+      <p><strong>Sui payout address:</strong> {worker.get("sui_address") or "(none on file — no real payouts)"}</p>
       <p><strong>Registered:</strong> {worker.get("registered_at", "?")}</p>
       <div class="stat"><span class="n">{worker.get("jobs_completed", 0)}</span><span class="l">jobs completed</span></div>
       <div class="stat"><span class="n">{worker.get("total_earned", 0)}</span><span class="l">earned (proxy, not yet real settlement)</span></div>

@@ -1,0 +1,10 @@
+{
+  "name": "sui-bridge",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "description": "Thin signing bridge: the Python control plane calls these to run the custodial escrow Move calls on Sui testnet via the official @mysten/sui TS SDK.",
+  "dependencies": {
+    "@mysten/sui": "^1.0.0"
+  }
+}

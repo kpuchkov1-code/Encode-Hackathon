@@ -1,0 +1,10 @@
+[package]
+name = "escrow"
+edition = "2024.beta"
+
+# Sui framework is provided by the toolchain at the matching testnet rev; no explicit
+# git dependency is pinned here so the published package tracks whatever `sui` CLI we
+# build with (sui-testnet-v1.73.x). `sui move build` injects the framework automatically.
+
+[addresses]
+escrow = "0x0"
