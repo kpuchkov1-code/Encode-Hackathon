@@ -50,7 +50,7 @@ export default function Home() {
 
         {/* The two doors */}
         <div className="mt-10 grid w-full gap-4 sm:grid-cols-2">
-          <RoleCard href="/buy" title="Pay for compute" primary />
+          <RoleCard href="/console" title="Pay for compute" primary />
           <RoleCard href="/sell" title="Rent out your hardware" />
         </div>
 

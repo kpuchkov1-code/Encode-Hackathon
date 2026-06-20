@@ -20,7 +20,7 @@ export function Nav() {
         <div className="flex items-center gap-5">
           <nav className="flex items-center gap-1 rounded-lg border border-border bg-surface p-0.5 text-sm">
             <Link
-              href="/buy"
+              href="/console"
               className="rounded-md px-3 py-1 text-muted transition-colors hover:bg-surface-2 hover:text-foreground"
             >
               Buy
