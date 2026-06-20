@@ -8,6 +8,12 @@ otherwise eat hours.
 Backend repo + context: this same repo. See `SESSION_HANDOFF.md` for the backend build
 state, and `docking_marketplace.plain` for the authoritative API behavior.
 
+> **Parallel-team setup:** you build the frontend, a teammate builds the backend.
+> The **shared contract both of you code to is `API_CONTRACT.md`** (change it via PR so the
+> other person sees it). To build the UI without waiting on the backend, run the mock:
+> `node mock/mock-server.js` (serves the full contract on `localhost:8000`, lifecycle
+> animates, see `mock/README.md`). Swap to the real/tunneled backend later via one env var.
+
 ---
 
 ## 1. What you're building

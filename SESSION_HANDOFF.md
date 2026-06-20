@@ -8,6 +8,15 @@ the backend build in a fresh Claude Code session. Pair it with:
 
 Last updated: 2026-06-20. Backend is at **Tasks 0–3 complete, Task 4 next.**
 
+> **Parallel-team setup:** a teammate is building the frontend (Vercel/v0) against
+> `API_CONTRACT.md` — the shared, frozen API contract. The backend you build here MUST
+> match it exactly (snake_case keys, status codes, shapes). `mock/mock-server.js`
+> implements the contract and is the reference for `/result`, `/proof`, and the `/jobs`
+> list endpoint the frontend needs. If you must change a shape, update `API_CONTRACT.md`
+> + the mock in the same PR and tell the frontend dev. Frontend asks (see
+> `FRONTEND_HANDOFF.md` §10): add a `GET /jobs` list endpoint; keep escrow/result/proof
+> observable via endpoints.
+
 ---
 
 ## 1. What we are building
