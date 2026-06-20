@@ -1,11 +1,11 @@
 """Control-plane API: job intake, status, escrow, results/proof.
 
 This is the Vercel-deployable piece -- Vercel's Python runtime serves this module's
-`app` (a standard ASGI app) directly. It never runs gnina itself: real docking can take
-far longer than a serverless function's execution limit, so jobs are dispatched to a
-separately-running worker (see worker_app.py) over HTTP, and the worker calls back here
-when done (see /jobs/{job_id}/worker-callback) instead of the control plane blocking on
-the full docking run.
+`app` (a standard ASGI app) directly. It never runs gnina itself, and it never reaches
+out to a worker either: idle-compute machines (worker_daemon.py) typically sit behind
+NAT and can't accept inbound connections, so this is a pure pull model -- daemons poll
+POST /jobs/claim for work, run it themselves, and report back via
+POST /jobs/{job_id}/worker-callback. The control plane never blocks on a docking run.
 
 Hand-written (Codeplain dropped, see SESSION_HANDOFF.md).
 """
@@ -13,7 +13,6 @@ import os
 import sys
 from typing import Optional
 
-import requests
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -21,9 +20,6 @@ from pydantic import BaseModel, Field, model_validator
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import models  # noqa: E402
-
-WORKER_URL = os.environ.get("WORKER_URL", "http://localhost:8001")
-CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://localhost:8000")
 
 app = FastAPI(title="docking-marketplace-control-plane")
 
@@ -93,25 +89,21 @@ def submit_job(job_spec: JobSpec) -> dict:
     spec_dict = job_spec.model_dump()
     created = models.create_job(spec_dict)
     job_id = created["job_id"]
-
     models.escrow_hold(job_id, spec_dict["payment"]["amount"], spec_dict["payment"]["supplier_id"])
-
-    try:
-        requests.post(
-            f"{WORKER_URL}/dock",
-            json={
-                "job_id": job_id,
-                "job_spec": spec_dict,
-                "callback_url": f"{CONTROL_PLANE_URL}/jobs/{job_id}/worker-callback",
-            },
-            timeout=5,
-        ).raise_for_status()
-        models.update_job(job_id, state="running")
-    except requests.RequestException as exc:
-        models.update_job(job_id, state="failed", reason=f"could not dispatch to worker: {exc}")
-        models.escrow_refund(job_id)
-
     return created
+
+
+class ClaimRequest(BaseModel):
+    worker_id: str
+
+
+@app.post("/jobs/claim")
+def claim_job(claim: ClaimRequest) -> dict:
+    """Polled by worker daemons (never pushed to -- they may be behind NAT)."""
+    job = models.claim_next_job(claim.worker_id)
+    if job is None:
+        return {"job": None}
+    return {"job": {"job_id": job["job_id"], "job_spec": job["spec"]}}
 
 
 @app.get("/jobs/{job_id}")

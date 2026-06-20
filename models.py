@@ -25,6 +25,7 @@ def init_db() -> None:
             state TEXT NOT NULL,
             reason TEXT NOT NULL DEFAULT '',
             result_json TEXT,
+            claimed_by TEXT,
             created_at TEXT NOT NULL
         )
         """
@@ -49,7 +50,7 @@ def create_job(job_spec: dict) -> dict:
 def get_job(job_id: str) -> dict | None:
     conn = sqlite3.connect(DB_PATH)
     row = conn.execute(
-        "SELECT job_id, spec_json, state, reason, result_json, created_at FROM jobs WHERE job_id = ?",
+        "SELECT job_id, spec_json, state, reason, result_json, claimed_by, created_at FROM jobs WHERE job_id = ?",
         (job_id,),
     ).fetchone()
     conn.close()
@@ -61,8 +62,36 @@ def get_job(job_id: str) -> dict | None:
         "state": row[2],
         "reason": row[3],
         "result": json.loads(row[4]) if row[4] else None,
-        "created_at": row[5],
+        "claimed_by": row[5],
+        "created_at": row[6],
     }
+
+
+def claim_next_job(worker_id: str) -> dict | None:
+    """Atomically claims the oldest queued job for a polling worker daemon.
+
+    Returns the full job dict (including spec) on success, or None if there is
+    nothing queued. Uses a conditional UPDATE so two daemons racing to claim
+    the same job can't both succeed.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT job_id FROM jobs WHERE state = 'queued' ORDER BY created_at LIMIT 1"
+    ).fetchone()
+    if row is None:
+        conn.close()
+        return None
+
+    job_id = row[0]
+    cur = conn.execute(
+        "UPDATE jobs SET state = 'running', claimed_by = ? WHERE job_id = ? AND state = 'queued'",
+        (worker_id, job_id),
+    )
+    conn.commit()
+    conn.close()
+    if cur.rowcount == 0:
+        return None  # lost the race to another daemon
+    return get_job(job_id)
 
 
 def update_job(job_id: str, *, state: str | None = None, reason: str | None = None,
