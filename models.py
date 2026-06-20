@@ -27,6 +27,7 @@ VALID_STATES = {"pending_payment", "queued", "running", "docked", "proven", "set
 JOB_KEY = "job:{job_id}"
 ESCROW_KEY = "escrow:{job_id}"
 QUEUE_KEY = "queued_jobs"
+RUNNING_SET_KEY = "running_jobs"
 WORKER_KEY = "worker:{worker_id}"
 WORKERS_SET_KEY = "registered_workers"
 RESEARCHER_KEY = "researcher:{researcher_id}"
@@ -108,8 +109,63 @@ def claim_next_job(worker_id: str) -> dict | None:
         return None  # shouldn't happen, but don't crash the daemon over it
     record["state"] = "running"
     record["claimed_by"] = worker_id
+    record["started_at"] = datetime.now(timezone.utc).isoformat()
+    record["attempts"] = record.get("attempts", 0) + 1
     _put_job(record)
+    _cmd("SADD", RUNNING_SET_KEY, job_id)  # tracked so reclaim_stale_jobs() can find it
     return record
+
+
+RUNNING_TIMEOUT_SECONDS = 60   # only reclaim after this AND the worker has gone offline
+MAX_JOB_ATTEMPTS = 3           # give up (fail + refund) rather than requeue forever
+
+
+def finish_running(job_id: str) -> None:
+    """Drop a job from the running set once it reaches a terminal state (docked/failed),
+    so reclaim_stale_jobs() never reconsiders it."""
+    _cmd("SREM", RUNNING_SET_KEY, job_id)
+
+
+def reclaim_stale_jobs() -> list[dict]:
+    """Lazy recovery for daemons that die MID-job. A job in `running` whose worker has
+    gone offline (no heartbeat for HEARTBEAT_TIMEOUT_SECONDS) and whose start is older
+    than RUNNING_TIMEOUT_SECONDS is presumed abandoned: it's re-queued for another daemon
+    up to MAX_JOB_ATTEMPTS, then failed + refunded. A worker that's still online (its
+    heartbeat thread keeps pinging even while blocked on a long docking run) is left
+    alone no matter how long the job takes. Called opportunistically from /jobs/claim, so
+    the serverless control plane needs no background cron to drive it."""
+    reclaimed = []
+    for job_id in _cmd("SMEMBERS", RUNNING_SET_KEY) or []:
+        record = get_job(job_id)
+        if record is None or record["state"] != "running":
+            _cmd("SREM", RUNNING_SET_KEY, job_id)  # terminal/gone already; clean the set
+            continue
+        started_at = record.get("started_at")
+        if started_at is None:
+            continue
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(started_at)).total_seconds()
+        if age < RUNNING_TIMEOUT_SECONDS:
+            continue
+        worker = get_worker(record.get("claimed_by") or "")
+        if worker is not None and worker.get("status") == "online":
+            continue  # still alive and presumably still working -- not abandoned
+        _cmd("SREM", RUNNING_SET_KEY, job_id)
+        if record.get("attempts", 1) >= MAX_JOB_ATTEMPTS:
+            record["state"] = "failed"
+            record["reason"] = (
+                f"abandoned after {record.get('attempts', 1)} attempt(s): "
+                "worker went offline mid-job"
+            )
+            _put_job(record)
+            escrow_refund(job_id)
+            reclaimed.append({"job_id": job_id, "action": "failed"})
+        else:
+            record["state"] = "queued"
+            record["claimed_by"] = None
+            _put_job(record)
+            _cmd("RPUSH", QUEUE_KEY, job_id)
+            reclaimed.append({"job_id": job_id, "action": "requeued"})
+    return reclaimed
 
 
 def update_job(job_id: str, *, state: str | None = None, reason: str | None = None,

@@ -284,6 +284,11 @@ def claim_job(claim: WorkerAuth) -> dict:
     proved it owns this worker_id -- not just anyone who guesses or types the name."""
     _require_worker_token(claim)
     models.update_worker(claim.worker_id, heartbeat=True)  # polling itself is the heartbeat
+    # Opportunistic recovery: a daemon polling for work is the natural moment to sweep up
+    # jobs abandoned by some other daemon that died mid-run, since the serverless control
+    # plane has no background process of its own to do it. Requeued jobs become claimable
+    # right here in the same poll cycle.
+    models.reclaim_stale_jobs()
     job = models.claim_next_job(claim.worker_id)
     if job is None:
         return {"job": None}
@@ -386,6 +391,14 @@ def worker_callback(job_id: str, callback: WorkerCallback) -> dict:
     job = models.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404)
+
+    # A zombie worker -- one that was declared dead, had its job reclaimed/requeued or
+    # failed, then came back to life and finished -- must not be able to clobber a job
+    # that's since moved on. Only a job still genuinely `running` accepts a callback.
+    if job["state"] != "running":
+        return {"ok": True, "ignored": f"job already in state {job['state']}"}
+
+    models.finish_running(job_id)  # reached a terminal state -- reclaim sweep can ignore it
 
     if callback.error is not None:
         models.update_job(job_id, state="failed", reason=callback.error)
