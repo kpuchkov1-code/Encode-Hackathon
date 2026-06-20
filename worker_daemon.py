@@ -152,6 +152,38 @@ def report_error(job_id: str, error: str) -> None:
     requests.post(f"{CONTROL_PLANE_URL}/jobs/{job_id}/worker-callback", json={"error": error}, timeout=10)
 
 
+PROGRESS_POLL_SECONDS = 3
+
+
+def progress_watcher(job_id: str, job_dir: str, stop_event: threading.Event) -> None:
+    """While the engine container docks ligand-by-ligand it writes {job_dir}/progress.json
+    (shared via the -v mount). This thread watches that file and forwards each update to the
+    control plane so the researcher's job page shows a live progress bar for big screening
+    libraries instead of an opaque 'running' until the very end. Best-effort: any failure
+    here must never affect the actual docking run."""
+    progress_path = os.path.join(job_dir, "progress.json")
+    last = None
+    while not stop_event.wait(PROGRESS_POLL_SECONDS):
+        try:
+            with open(progress_path) as f:
+                p = json.load(f)
+        except (OSError, ValueError):
+            continue
+        key = (p.get("done"), p.get("total"))
+        if key == last:
+            continue
+        last = key
+        try:
+            requests.post(
+                f"{CONTROL_PLANE_URL}/jobs/{job_id}/progress",
+                json={"worker_id": WORKER_ID, "token": WORKER_TOKEN,
+                      "done": p.get("done", 0), "total": p.get("total", 0)},
+                timeout=5,
+            )
+        except requests.RequestException:
+            log.debug("progress ping failed (will retry)", exc_info=True)
+
+
 def run_one_job(job_id: str, job_spec: dict, gpu_available: bool) -> None:
     log.info("claimed job %s, running engine container...", job_id)
     job_dir = tempfile.mkdtemp(prefix=f"job_{job_id}_")
@@ -164,7 +196,15 @@ def run_one_job(job_id: str, job_spec: dict, gpu_available: bool) -> None:
             cmd += ["--gpus", "all"]
         cmd += ["-v", f"{job_dir}:/job", ENGINE_IMAGE]
 
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        progress_stop = threading.Event()
+        progress_thread = threading.Thread(
+            target=progress_watcher, args=(job_id, job_dir, progress_stop), daemon=True)
+        progress_thread.start()
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+        finally:
+            progress_stop.set()
+            progress_thread.join(timeout=PROGRESS_POLL_SECONDS + 1)
         result_path = os.path.join(job_dir, "result.json")
         if not os.path.exists(result_path):
             raise RuntimeError(f"engine container produced no result.json (exit {proc.returncode}): {proc.stderr[-2000:]}")

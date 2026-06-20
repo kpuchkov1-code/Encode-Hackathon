@@ -2,16 +2,17 @@
 // own small service (Render/Railway/Fly/a separate Vercel project) so the existing
 // Python control plane on Vercel stays untouched -- it just calls this over HTTP via
 // SUI_BRIDGE_URL. Every request must carry the shared secret (SUI_BRIDGE_SECRET) in the
-// `x-bridge-secret` header, since whoever can reach these endpoints can move the
-// platform's custodial funds.
+// `x-bridge-secret` header, since whoever can reach the release/refund endpoints can
+// trigger the arbiter-signed payouts.
 //
 // Endpoints (all POST, JSON body):
-//   /address                         -> { address }
-//   /lock    { jobId, amountMist }   -> { digest, escrowObjectId, amountMist }
+//   /address                          -> { address }
+//   /info                             -> { packageId, module, arbiter, network }
+//   /inspect { escrowObjectId }       -> { escrowObjectId, jobId, payer, arbiter, amountMist, type }
 //   /release { escrowObjectId, providerAddress } -> { digest }
-//   /refund  { escrowObjectId }      -> { digest }
+//   /refund  { escrowObjectId }       -> { digest }
 import { createServer } from 'node:http';
-import { lock, release, refund, platformAddress } from './escrow.mjs';
+import { release, refund, inspect, info, platformAddress } from './escrow.mjs';
 
 const SECRET = process.env.SUI_BRIDGE_SECRET;
 const PORT = process.env.PORT || 8787;
@@ -42,7 +43,8 @@ const server = createServer(async (req, res) => {
     const body = await readBody(req);
     const path = (req.url || '').split('?')[0];
     if (path === '/address') return send(200, { address: platformAddress() });
-    if (path === '/lock') return send(200, await lock(body.jobId, body.amountMist));
+    if (path === '/info') return send(200, info());
+    if (path === '/inspect') return send(200, await inspect(body.escrowObjectId));
     if (path === '/release') return send(200, await release(body.escrowObjectId, body.providerAddress));
     if (path === '/refund') return send(200, await refund(body.escrowObjectId));
     return send(404, { error: `unknown path ${path}` });

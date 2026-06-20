@@ -1,20 +1,35 @@
 # Sui escrow bridge
 
-Real, on-chain custodial escrow for the docking marketplace, on **Sui testnet**. The
-Python control plane never holds a key or talks to Sui directly — it calls this bridge,
-which signs with the single custodial **platform key** and moves real SUI against the
-`escrow::escrow` Move module.
+Real, on-chain **trustless** escrow for the docking marketplace, on **Sui testnet**. The
+escrow is a **shared** Move object: the **researcher locks their own funds with their own
+wallet** (their coins, their signature — see the `/jobs/{id}/pay` page in the control
+plane), and the platform is recorded only as the **arbiter**. The arbiter can *trigger* a
+payout but the `escrow::escrow` Move module fixes the destinations — `release` pays the
+provider, `refund` can ONLY return funds to the recorded payer — so the platform can never
+divert the money to itself. That is the trustless guarantee: you trust the contract, not
+the operator.
 
-Flow: researcher confirms a job → platform **locks** SUI in an on-chain `Escrow` object →
-job is verified → platform **releases** that SUI to the provider's address (or **refunds**
-itself if the job fails/is abandoned). Every move is a real transaction, auditable on
-Suiscan; the digests are shown on the job page.
+This bridge is what the Python control plane calls. It does two things:
+
+- **read-only `inspect`/`info`** — no key. Used by the backend to *trustlessly verify* a
+  researcher-signed lock (right job id, right arbiter, enough money) before queueing the
+  job, and to hand the frontend the package id + arbiter it needs to build the lock tx.
+- **arbiter-signed `release`/`refund`** — signed by the platform key (`SUI_PLATFORM_KEY`).
+  The Move module asserts `ctx.sender() == arbiter`, so only the platform can trigger
+  these, and only to the contract-fixed destinations.
+
+The researcher's lock is signed **in their browser**, never here — there is no `lock`/`pay`
+op on the bridge anymore.
+
+Every move is a real transaction, auditable on Suiscan; the digests are shown on the job
+page.
 
 ## Deployed (testnet)
 
-- **Move package id:** `0x44e46fbdcaae2716033573127ce545aa6b91005aa878e750b57797671a23b5ee`
-- **Platform (custodial) address:** `0xbfc2f7d32e0b2df8a086fcbe30d394cd4d60b638ae3b53fa7329747a741de072`
-- Fund the platform address from https://faucet.sui.io/?address=0xbfc2f7d32e0b2df8a086fcbe30d394cd4d60b638ae3b53fa7329747a741de072
+- **Move package id:** `0x6d6321b8f9e54976a2ad150690fb949eae50b388c231d64a5db34cc1172dc56c`
+- **Platform (arbiter) address:** `0xbfc2f7d32e0b2df8a086fcbe30d394cd4d60b638ae3b53fa7329747a741de072`
+- Fund the platform address (it only needs gas for release/refund — the escrow principal
+  comes from researchers): https://faucet.sui.io/?address=0xbfc2f7d32e0b2df8a086fcbe30d394cd4d60b638ae3b53fa7329747a741de072
 
 The platform **private key** is not in git. It lives in `sui-bridge/.env.local` (gitignored)
 for local dev, and must be set as `SUI_PLATFORM_KEY` in the deployed bridge's environment.
@@ -22,13 +37,13 @@ for local dev, and must be set as `SUI_PLATFORM_KEY` in the deployed bridge's en
 ## Two ways the control plane reaches the bridge
 
 The on-chain layer is **opt-in**: with neither env var set, `models.escrow_*` stays the
-pure-KV mock and nothing changes.
+pure-KV mock (and the pay page falls back to a no-wallet confirm).
 
 1. **Local dev — subprocess.** Set on the *control plane*:
    ```
    SUI_BRIDGE_CMD="node /abs/path/to/sui-bridge/cli.mjs"
    SUI_PLATFORM_KEY=suiprivkey1...        # read by cli.mjs
-   ESCROW_PACKAGE_ID=0x44e4...b5ee        # read by cli.mjs
+   ESCROW_PACKAGE_ID=0x6d63...c56c        # read by cli.mjs
    ```
 
 2. **Production — HTTP service.** Deploy `server.mjs` as its own small service (Render /
@@ -38,27 +53,34 @@ pure-KV mock and nothing changes.
    same `SUI_BRIDGE_SECRET`.
 
    ```
-   SUI_PLATFORM_KEY=suiprivkey1... ESCROW_PACKAGE_ID=0x44e4...b5ee \
+   SUI_PLATFORM_KEY=suiprivkey1... ESCROW_PACKAGE_ID=0x6d63...c56c \
      SUI_BRIDGE_SECRET=<shared> node server.mjs   # listens on :8787
    ```
+
+   Note: `/inspect` and `/info` are read-only but still go through the shared-secret gate,
+   since `/release` and `/refund` (which move funds) live on the same service.
 
 ## Pricing → SUI
 
 `MIST_PER_PRICE_UNIT` (control plane, default `1000000`) maps one abstract price unit
-("$") to MIST. Default is 1 unit = 0.001 SUI, deliberately tiny so testnet funds last.
+("$") to MIST. Default is 1 unit = 0.001 SUI, deliberately tiny so testnet funds last. The
+frontend reads the exact MIST amount from the job's payment intent and the wallet locks
+exactly that.
 
 ## Rebuild / republish the Move module
 
 ```
 cd move/escrow && sui client publish --skip-dependency-verification
 ```
-Then update `ESCROW_PACKAGE_ID` everywhere it's set.
+Then update `ESCROW_PACKAGE_ID` everywhere it's set (bridge env) — the frontend reads it
+live from `/chain/info`, so nothing is hardcoded there.
 
 ## CLI (handy for manual checks)
 
 ```
 node cli.mjs address
-node cli.mjs lock    <jobId> <amountMist>
+node cli.mjs info                                  # { packageId, module, arbiter, network }
+node cli.mjs inspect <escrowObjectId>              # { jobId, payer, arbiter, amountMist, ... }
 node cli.mjs release <escrowObjectId> <providerAddress>
 node cli.mjs refund  <escrowObjectId>
 ```

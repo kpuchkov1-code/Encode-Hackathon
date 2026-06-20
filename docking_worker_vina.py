@@ -7,12 +7,28 @@ architecture quickly; gnina remains the real target engine (see Dockerfile, gnin
 Reuses docking_worker's engine-agnostic receptor/ligand prep (RDKit-based, identical
 for any docking engine) -- only the actual docking call differs.
 """
+import json
 import os
 
 from rdkit import Chem
 from vina import Vina
 
 import docking_worker  # reuse prepare_receptor, split_ligands
+
+
+def _write_progress(work_dir: str, done: int, total: int) -> None:
+    """Emit per-ligand progress to /job/progress.json (the shared Docker mount root, one
+    level up from this engine's work_dir), so the host daemon can watch it and forward
+    progress to the control plane while the container is still running. Best-effort --
+    a screening run of 1000 ligands shouldn't ever fail because a progress write hiccuped."""
+    try:
+        progress_path = os.path.join(os.path.dirname(os.path.abspath(work_dir)), "progress.json")
+        tmp = progress_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"done": done, "total": total}, f)
+        os.replace(tmp, progress_path)  # atomic so the watcher never reads a half-written file
+    except OSError:
+        pass
 
 
 def _bounding_box(sdf_path: str) -> tuple[list[float], list[float]]:
@@ -66,11 +82,14 @@ def dock_job(job_spec: dict, work_dir: str) -> list[dict]:
     _prep_pdbqt(receptor_pdb, receptor_pdbqt, is_receptor=True)
 
     prepped = docking_worker.split_ligands(job_spec["ligands_sdf"], work_dir)
+    total = len(prepped)
+    _write_progress(work_dir, 0, total)
     results = []
-    for entry in prepped:
+    for i, entry in enumerate(prepped):
         ligand_id = entry["ligand_id"]
         if "error" in entry:
             results.append({"ligand_id": ligand_id, "error": entry["error"]})
+            _write_progress(work_dir, i + 1, total)
             continue
         try:
             ligand_pdbqt = os.path.join(work_dir, f"{ligand_id}.pdbqt")
@@ -86,6 +105,7 @@ def dock_job(job_spec: dict, work_dir: str) -> list[dict]:
             results.append({"ligand_id": ligand_id, "vina_affinity": affinity, "pose_pdbqt": pose_pdbqt})
         except Exception as exc:  # noqa: BLE001 -- one ligand's failure must not abort the job
             results.append({"ligand_id": ligand_id, "error": str(exc)})
+        _write_progress(work_dir, i + 1, total)
 
     ok = [r for r in results if "error" not in r]
     failed = [r for r in results if "error" in r]

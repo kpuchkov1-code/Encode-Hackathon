@@ -55,7 +55,8 @@ def _sui(op: str, payload: dict) -> dict:
 
         arg_order = {
             "address": [],
-            "lock": ["jobId", "amountMist"],
+            "info": [],
+            "inspect": ["escrowObjectId"],
             "release": ["escrowObjectId", "providerAddress"],
             "refund": ["escrowObjectId"],
         }[op]
@@ -82,7 +83,12 @@ RUNNING_SET_KEY = "running_jobs"
 WORKER_KEY = "worker:{worker_id}"
 WORKERS_SET_KEY = "registered_workers"
 RESEARCHER_KEY = "researcher:{researcher_id}"
+RESEARCHER_EMAIL_KEY = "researcher_email:{email}"  # email -> researcher_id (login lookup)
 RESEARCHERS_SET_KEY = "registered_researchers"
+# Per-actor job indexes (lists of job_ids, newest first via LPUSH) so the researcher
+# "my jobs" page and the provider dashboard don't have to SCAN the whole keyspace.
+RESEARCHER_JOBS_KEY = "researcher_jobs:{researcher_id}"
+WORKER_JOBS_KEY = "worker_jobs:{worker_id}"
 
 
 def _cmd(*args) -> object:
@@ -117,20 +123,110 @@ def create_job(job_spec: dict, *, price: float, researcher_id: str) -> dict:
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     _cmd("SET", JOB_KEY.format(job_id=job_id), json.dumps(record))
+    # Index under the researcher so their "my jobs" page lists it immediately -- even
+    # while still pending_payment, so they can come back and finish paying.
+    _cmd("LPUSH", RESEARCHER_JOBS_KEY.format(researcher_id=researcher_id), job_id)
     return {"job_id": job_id, "state": "pending_payment", "price": price}
 
 
 def confirm_job(job_id: str) -> dict | None:
-    """Researcher has agreed to the price -- hold escrow and actually enqueue the job
-    for a worker daemon to claim. Returns None if the job doesn't exist or isn't
-    awaiting payment (e.g. already confirmed, or expired/failed)."""
+    """Researcher has agreed to the price. Returns None if the job doesn't exist or isn't
+    awaiting payment (e.g. already confirmed, or expired/failed).
+
+    On-chain: this does NOT queue the job. The researcher must lock the price into escrow
+    from their *own* wallet first (in the browser, see the /jobs/{id}/pay page); the
+    returned `payment` intent tells the frontend which Move package to call and the exact
+    amount. The job is queued only once record_escrow_lock() has trustlessly verified that
+    lock on-chain. Off-chain (KV mock): there is no wallet step, so it queues immediately,
+    preserving the old local-dev behaviour.
+
+    Returns the job record (with a `payment` intent attached when on-chain)."""
     record = get_job(job_id)
     if record is None or record["state"] != "pending_payment":
         return None
+    if SUI_ONCHAIN:
+        record = dict(record)
+        record["payment"] = payment_intent(job_id)
+        return record
     record["state"] = "queued"
     _put_job(record)
     _cmd("RPUSH", QUEUE_KEY, job_id)
     escrow_hold(job_id, record["price"], record["spec"]["payment"]["supplier_id"])
+    increment_researcher_stats(record["researcher_id"], submitted=True, spent=record["price"])
+    return record
+
+
+def price_to_mist(amount: float) -> int:
+    """Convert an abstract price unit to on-chain MIST (the smallest SUI denomination)."""
+    return int(round(amount * MIST_PER_PRICE_UNIT))
+
+
+def chain_info() -> dict | None:
+    """Package id + arbiter address the frontend needs to build a lock transaction.
+    None when off-chain (no wallet flow)."""
+    if not SUI_ONCHAIN:
+        return None
+    return _sui("info", {})
+
+
+def payment_intent(job_id: str) -> dict | None:
+    """Everything the researcher's browser wallet needs to lock the right amount for this
+    job: the price in MIST, the Move package/module to call, and the arbiter address the
+    lock must name. None if the job doesn't exist."""
+    record = get_job(job_id)
+    if record is None:
+        return None
+    intent = {
+        "job_id": job_id,
+        "price": record["price"],
+        "amount_mist": price_to_mist(record["price"]),
+        "onchain": SUI_ONCHAIN,
+    }
+    if SUI_ONCHAIN:
+        info = _sui("info", {})
+        intent["package_id"] = info["packageId"]
+        intent["module"] = info.get("module", "escrow")
+        intent["arbiter"] = info["arbiter"]
+        intent["network"] = info.get("network", "testnet")
+    return intent
+
+
+def record_escrow_lock(job_id: str, escrow_object_id: str) -> dict:
+    """Trustlessly verify a researcher-signed on-chain lock, then queue the job. Reads the
+    shared Escrow object straight from chain and checks it really (a) locks THIS job's id,
+    (b) names this platform as the arbiter, and (c) holds at least the job price. Raises
+    ValueError on any mismatch, so a forged, short, or wrong-job lock can never queue a
+    job. The platform never had to trust the researcher's claim -- it reads the chain."""
+    record = get_job(job_id)
+    if record is None:
+        raise ValueError("job not found")
+    if record["state"] != "pending_payment":
+        raise ValueError(f"job is not awaiting payment (state={record['state']})")
+    info = _sui("info", {})
+    onchain = _sui("inspect", {"escrowObjectId": escrow_object_id})
+    if onchain.get("jobId") != job_id:
+        raise ValueError("on-chain escrow is for a different job")
+    if (onchain.get("arbiter") or "").lower() != info["arbiter"].lower():
+        raise ValueError("on-chain escrow names a different arbiter")
+    price_mist = price_to_mist(record["price"])
+    if int(onchain.get("amountMist") or 0) < price_mist:
+        raise ValueError("on-chain escrow holds less than the job price")
+    erecord = {
+        "state": "held",
+        "amount": record["price"],
+        "supplier_id": record["spec"]["payment"]["supplier_id"],
+        "chain": {
+            "network": "sui-testnet",
+            "amount_mist": int(onchain["amountMist"]),
+            "escrow_object_id": escrow_object_id,
+            "payer": onchain.get("payer"),
+            "arbiter": onchain.get("arbiter"),
+        },
+    }
+    _cmd("SET", ESCROW_KEY.format(job_id=job_id), json.dumps(erecord))
+    record["state"] = "queued"
+    _put_job(record)
+    _cmd("RPUSH", QUEUE_KEY, job_id)
     increment_researcher_stats(record["researcher_id"], submitted=True, spent=record["price"])
     return record
 
@@ -206,6 +302,9 @@ def claim_next_job(worker_id: str) -> dict | None:
     record["attempts"] = record.get("attempts", 0) + 1
     _put_job(record)
     _cmd("SADD", RUNNING_SET_KEY, job_id)  # tracked so reclaim_stale_jobs() can find it
+    # Index under the worker so its provider dashboard can list everything it has run
+    # (deduped on read, since a reclaimed job can be claimed by the same worker twice).
+    _cmd("LPUSH", WORKER_JOBS_KEY.format(worker_id=worker_id), job_id)
     return record
 
 
@@ -287,16 +386,10 @@ def update_job_extra(job_id: str, **fields) -> None:
 
 
 def escrow_hold(job_id: str, amount: float, supplier_id: str) -> None:
+    """Off-chain (KV mock) hold only. In the on-chain flow the researcher locks their own
+    funds from their browser wallet and record_escrow_lock() persists the held escrow after
+    verifying it on-chain -- this function is not used on that path."""
     record = {"state": "held", "amount": amount, "supplier_id": supplier_id}
-    if SUI_ONCHAIN:
-        amount_mist = int(round(amount * MIST_PER_PRICE_UNIT))
-        locked = _sui("lock", {"jobId": job_id, "amountMist": amount_mist})
-        record["chain"] = {
-            "network": "sui-testnet",
-            "amount_mist": amount_mist,
-            "escrow_object_id": locked.get("escrowObjectId"),
-            "lock_digest": locked.get("digest"),
-        }
     _cmd("SET", ESCROW_KEY.format(job_id=job_id), json.dumps(record))
 
 
@@ -428,7 +521,27 @@ def increment_worker_stats(worker_id: str, *, completed: bool = False, earned: f
     _cmd("SET", WORKER_KEY.format(worker_id=worker_id), json.dumps(record))
 
 
+def _norm_email(email: str) -> str:
+    return (email or "").strip().lower()
+
+
+def get_researcher_by_email(email: str) -> dict | None:
+    """Look up a researcher by their email (the login key). Returns None if unknown."""
+    rid = _cmd("GET", RESEARCHER_EMAIL_KEY.format(email=_norm_email(email)))
+    return get_researcher(rid) if rid else None
+
+
 def create_researcher_identity(email: str) -> dict:
+    """Sign-up-or-sign-in by email. The email is the identity; the researcher_id is an
+    internal handle mapped from it and never typed by the user. Idempotent: signing in
+    again with the same email returns the existing account (so a researcher never ends up
+    with duplicate ids). Researchers self-custody -- they connect their own browser wallet
+    and sign the escrow lock themselves (see the /jobs/{id}/pay page); the platform never
+    holds a researcher key, so nothing wallet-related is generated or stored here."""
+    email = _norm_email(email)
+    existing = get_researcher_by_email(email)
+    if existing is not None:
+        return existing
     researcher_id = f"researcher-{uuid.uuid4().hex[:12]}"
     record = {
         "researcher_id": researcher_id,
@@ -438,8 +551,17 @@ def create_researcher_identity(email: str) -> dict:
         "total_spent": 0,
     }
     _cmd("SET", RESEARCHER_KEY.format(researcher_id=researcher_id), json.dumps(record))
+    _cmd("SET", RESEARCHER_EMAIL_KEY.format(email=email), researcher_id)
     _cmd("SADD", RESEARCHERS_SET_KEY, researcher_id)
     return record
+
+
+def public_researcher(record: dict | None) -> dict | None:
+    """A researcher record safe to expose. No server-held secrets exist in the trustless
+    model, but legacy records may still carry a custodial `sui_secret` -- strip it."""
+    if record is None:
+        return None
+    return {k: v for k, v in record.items() if k != "sui_secret"}
 
 
 def get_researcher(researcher_id: str) -> dict | None:
@@ -476,6 +598,33 @@ def list_all_jobs() -> list[dict]:
         if cursor == "0" or cursor == 0:
             break
     return jobs
+
+
+def _jobs_from_ids(ids: list[str]) -> list[dict]:
+    """Resolve a list of job_ids to their records, in order, dropping duplicates (a
+    reclaimed job can be indexed twice) and any that no longer exist."""
+    seen: set[str] = set()
+    out = []
+    for jid in ids or []:
+        if jid in seen:
+            continue
+        seen.add(jid)
+        record = get_job(jid)
+        if record is not None:
+            out.append(record)
+    return out
+
+
+def list_researcher_jobs(researcher_id: str) -> list[dict]:
+    """Every job this researcher submitted, newest first, for their 'my jobs' page."""
+    ids = _cmd("LRANGE", RESEARCHER_JOBS_KEY.format(researcher_id=researcher_id), 0, -1)
+    return _jobs_from_ids(ids)
+
+
+def list_worker_jobs(worker_id: str) -> list[dict]:
+    """Every job this worker claimed/ran, newest first, for the provider dashboard."""
+    ids = _cmd("LRANGE", WORKER_JOBS_KEY.format(worker_id=worker_id), 0, -1)
+    return _jobs_from_ids(ids)
 
 
 def queue_depth() -> int:

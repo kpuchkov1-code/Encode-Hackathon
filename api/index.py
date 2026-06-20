@@ -9,8 +9,10 @@ POST /jobs/{job_id}/worker-callback. The control plane never blocks on a docking
 
 Hand-written (Codeplain dropped, see SESSION_HANDOFF.md).
 """
+import json
 import math
 import os
+import re
 import secrets
 import sys
 from datetime import datetime, timezone
@@ -18,7 +20,7 @@ from typing import Optional
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field, model_validator
 
@@ -104,12 +106,18 @@ _BASE_CSS = """
   .stat .n { font-size: 22px; font-weight: 700; display: block; }
   .stat .l { font-size: 12px; color: var(--muted); }
   .warn { background: #fef9c3; border: 1px solid #fde047; border-radius: 8px; padding: 12px 14px; font-size: 14px; }
+  .ok { color: var(--ok); }
+  .progress { background: #f1f5f9; border-radius: 999px; height: 16px; overflow: hidden; margin: 10px 0 6px; }
+  .progress > div { background: var(--accent); height: 100%; width: 0; transition: width .4s ease; }
+  .progress-label { font-size: 13px; color: var(--muted); }
+  .row-actions a { margin-right: 12px; font-size: 13px; }
 """
 
 _NAV = """
 <nav><div class="wrap">
-  <span class="brand">Docking Marketplace</span>
+  <a class="brand" href="/">Docking Marketplace</a>
   <a href="/researchers/submit">Submit a job</a>
+  <a href="/researchers/jobs">My jobs</a>
   <a href="/providers/signup">Provide compute</a>
 </div></nav>
 """
@@ -327,11 +335,53 @@ def submit_job(job_spec: JobSpec) -> dict:
 
 @app.post("/jobs/{job_id}/confirm")
 def confirm_job(job_id: str) -> dict:
-    """Researcher has seen the price and agreed -- hold escrow and actually queue the
-    job for a worker daemon to claim."""
+    """Researcher has seen the price and agreed. On-chain, this returns a `payment` intent
+    (price in MIST + Move package + arbiter) so the researcher's own wallet can lock the
+    funds; the job is queued only after POST /jobs/{id}/escrow-locked verifies that lock.
+    Off-chain (mock), it queues immediately."""
     record = models.confirm_job(job_id)
     if record is None:
         raise HTTPException(status_code=409, detail="job not found or not awaiting payment")
+    out = {"job_id": job_id, "state": record["state"]}
+    if record.get("payment"):
+        out["payment"] = record["payment"]
+    return out
+
+
+@app.get("/chain/info")
+def chain_info() -> dict:
+    """Public on-chain config for the frontend wallet flow: which Move escrow package to
+    call and which address must be named as arbiter. `onchain: false` when running in
+    off-chain mock mode (no wallet step)."""
+    info = models.chain_info()
+    if info is None:
+        return {"onchain": False}
+    return {"onchain": True, **info}
+
+
+@app.get("/jobs/{job_id}/payment-intent")
+def payment_intent(job_id: str) -> dict:
+    """What the researcher's browser wallet needs to lock the right amount for this job."""
+    intent = models.payment_intent(job_id)
+    if intent is None:
+        raise HTTPException(status_code=404)
+    return intent
+
+
+class EscrowLocked(BaseModel):
+    escrow_object_id: str
+
+
+@app.post("/jobs/{job_id}/escrow-locked")
+def escrow_locked(job_id: str, body: EscrowLocked) -> dict:
+    """Called by the researcher's browser right after their wallet locks the escrow.
+    The backend reads the escrow straight from chain and verifies it locks THIS job, names
+    this platform as arbiter, and holds at least the price -- only then is the job queued.
+    The platform never trusts the caller's word; it trusts the chain."""
+    try:
+        record = models.record_escrow_lock(job_id, body.escrow_object_id.strip())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     return {"job_id": job_id, "state": record["state"]}
 
 
@@ -420,36 +470,101 @@ def download_result(job_id: str) -> Response:
     )
 
 
+# A job is still "live" (worth auto-refreshing the page for) until it reaches one of
+# these final resting states.
+TERMINAL_STATES = {"settled", "disputed", "failed"}
+
+
+def _job_total_ligands(job: dict) -> int:
+    p = job.get("progress") or {}
+    if p.get("total"):
+        return int(p["total"])
+    return count_ligands(job.get("spec", {}).get("ligands_sdf", ""))
+
+
+def _job_done_ligands(job: dict) -> int:
+    """How many ligands are finished, for a progress bar. Once a result exists the job is
+    fully docked, so report total; otherwise use the live per-ligand progress ping."""
+    total = _job_total_ligands(job)
+    if job.get("result") is not None or job["state"] in (
+            "docked", "verifying", "proven", "settled"):
+        return total
+    return int((job.get("progress") or {}).get("done", 0))
+
+
+def _progress_html(job: dict) -> str:
+    """A live progress bar for multi-ligand jobs that are queued/running. Single-ligand
+    jobs (or terminal ones) get nothing -- a bar there is just noise."""
+    state = job["state"]
+    total = _job_total_ligands(job)
+    if total <= 1 or state in ("pending_payment", "failed", "disputed", "settled", "proven"):
+        return ""
+    done = _job_done_ligands(job)
+    pct = int(round(100 * done / total)) if total else 0
+    if state == "queued":
+        label = "Queued — waiting for a provider to pick this up…"
+        pct = 0
+    elif state == "running" and done == 0:
+        label = f"Running on a provider's hardware — preparing {total} ligands…"
+    elif state == "running":
+        label = f"Docking… {done} / {total} ligands ({pct}%)"
+    else:  # docked / verifying
+        label = f"Docked all {total} ligands"
+    return f"""<div class="card">
+      <div class="progress"><div style="width:{pct}%"></div></div>
+      <p class="progress-label">{label}</p>
+    </div>"""
+
+
 @app.get("/jobs/{job_id}/page", response_class=HTMLResponse)
 def get_job_page(job_id: str) -> str:
     job = models.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404)
     state = job["state"]
+    # Auto-refresh while the job is still moving, so the researcher watches it progress
+    # without manually reloading. Stops once it reaches a terminal state.
+    refresh = '<meta http-equiv="refresh" content="5">' if state not in TERMINAL_STATES else ""
+    nlig = _job_total_ligands(job)
+
     body = f"""
-    <h1>Job {job_id[:8]}</h1>
+    <h1>Job {job_id[:8]} {_state_badge(state)}</h1>
     <div class="card">
       <p><strong>Status:</strong> {state}</p>
+      <p><strong>Ligands:</strong> {nlig}</p>
       <p><strong>Price:</strong> ${job.get('price', '?')}</p>
     """
+    if state == "pending_payment":
+        body += f'<p class="row-actions"><a class="btn" href="/jobs/{job_id}/pay">Pay &amp; submit</a></p>'
     if state in ("failed", "disputed"):
         body += f"<p><strong>Reason:</strong> {job.get('reason', '')}</p>"
+    body += "</div>"
+
+    body += _progress_html(job)
+
     if state in RESULT_READY_STATES and job.get("result"):
+        ok = [r for r in job["result"] if "vina_affinity" in r]
+        failed = [r for r in job["result"] if "vina_affinity" not in r]
         rows = "".join(
-            f"<tr><td>{r['ligand_id']}</td><td>{r.get('vina_affinity', r.get('error', ''))}</td></tr>"
+            f"<tr><td class='mono'>{r['ligand_id']}</td>"
+            f"<td>{r.get('vina_affinity', r.get('error', ''))}</td></tr>"
             for r in job["result"]
         )
-        body += f"""
+        summary = f"{len(ok)} docked"
+        if failed:
+            summary += f" · {len(failed)} failed"
+        best = min((r["vina_affinity"] for r in ok), default=None)
+        best_html = f" · best affinity <strong>{best} kcal/mol</strong>" if best is not None else ""
+        body += f"""<div class="card">
+          <p class="lede">{summary}{best_html} (more negative = stronger predicted binding)</p>
           <table><tr><th>Ligand</th><th>Affinity (kcal/mol) / error</th></tr>{rows}</table>
           <a class="btn" href="/jobs/{job_id}/download">Download results (.zip)</a>
-        """
-    else:
-        body += "<p class=\"lede\">Refresh this page to check progress.</p>"
-    body += "</div>"
+        </div>"""
+
     body += _verification_html(job)
     body += _walrus_html(job)
     body += _escrow_chain_html(job_id)
-    return page(f"Job {job_id[:8]}", body)
+    return page(f"Job {job_id[:8]}", refresh + body)
 
 
 def _verification_html(job: dict) -> str:
@@ -503,9 +618,13 @@ def _escrow_chain_html(job_id: str) -> str:
         return ""
     sui = f"{chain.get('amount_mist', 0) / 1_000_000_000:.4f} SUI"
     rows = [f"<p><strong>Escrow on Sui testnet:</strong> {sui}</p>"]
+    if chain.get("payer"):
+        rows.append(f'<p>Locked by researcher (their own wallet): <a href="{_suiscan("account", chain["payer"])}">{chain["payer"][:18]}…</a></p>')
+    if chain.get("lock_digest"):
+        rows.append(f'<p>Lock tx: <a href="{_suiscan("tx", chain["lock_digest"])}">{chain["lock_digest"][:18]}…</a></p>')
     if chain.get("escrow_object_id"):
         rows.append(f'<p>Escrow object: <a href="{_suiscan("object", chain["escrow_object_id"])}">{chain["escrow_object_id"][:18]}…</a></p>')
-    for label, key in (("Lock", "lock_digest"), ("Release", "release_digest"), ("Refund", "refund_digest")):
+    for label, key in (("Release", "release_digest"), ("Refund", "refund_digest")):
         if chain.get(key):
             rows.append(f'<p>{label} tx: <a href="{_suiscan("tx", chain[key])}">{chain[key][:18]}…</a></p>')
     if chain.get("paid_to"):
@@ -656,6 +775,30 @@ def _handle_verification_callback(verif_job: dict, callback: WorkerCallback) -> 
     return {"ok": True, "verification": "failed"}
 
 
+class ProgressUpdate(WorkerAuth):
+    done: int
+    total: int
+
+
+@app.post("/jobs/{job_id}/progress")
+def job_progress(job_id: str, update: ProgressUpdate) -> dict:
+    """Live per-ligand progress, forwarded by the worker daemon as the engine docks each
+    ligand. Token-gated (only the worker actually running the job can report) and only
+    accepted while the job is `running`, so a stale ping can't disturb a finished job."""
+    _require_worker_token(update)
+    job = models.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404)
+    if job["state"] != "running" or job.get("claimed_by") != update.worker_id:
+        return {"ok": True, "ignored": f"job in state {job['state']}"}
+    models.update_job_extra(job_id, progress={
+        "done": update.done,
+        "total": update.total,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return {"ok": True}
+
+
 class WorkerRegistration(WorkerAuth):
     hardware_info: str = ""
 
@@ -701,9 +844,10 @@ def providers_signup_form() -> str:
     <div class="card">
       <form method="post" action="/providers/signup">
         <label>Sui payout address (testnet) &mdash; where you get paid when a job you
-        run is verified. Starts with <code>0x</code>. Optional, but without it you
-        won't receive real payouts.</label>
-        <input type="text" name="sui_address" placeholder="0x..." style="width:100%;margin:8px 0 16px">
+        run is verified. A 66-character address starting with <code>0x</code>.
+        <strong>Required</strong> &mdash; you can't be paid without it.</label>
+        <input type="text" name="sui_address" placeholder="0x..." required
+               pattern="0x[0-9a-fA-F]{64}" style="width:100%;margin:8px 0 16px">
         <button type="submit">Sign up</button>
       </form>
     </div>
@@ -711,7 +855,10 @@ def providers_signup_form() -> str:
 
 
 @app.post("/providers/signup", response_class=HTMLResponse)
-def providers_signup_submit(request: Request, sui_address: str = Form("")) -> str:
+def providers_signup_submit(request: Request, sui_address: str = Form(...)) -> str:
+    sui_address = sui_address.strip()
+    if not _valid_sui_address(sui_address):
+        raise HTTPException(status_code=400, detail="A valid Sui payout address (0x + 64 hex chars) is required.")
     identity = models.create_worker_identity(sui_address=sui_address)
     worker_id, token = identity["worker_id"], identity["token"]
     base_url = str(request.base_url).rstrip("/")
@@ -756,14 +903,70 @@ def get_worker_page(worker_id: str) -> str:
         raise HTTPException(status_code=404)
     worker.pop("token", None)
     badge = f'<span class="badge {worker["status"]}">{worker["status"]}</span>'
+
+    jobs = models.list_worker_jobs(worker_id)
+    any_live = any(j["state"] not in TERMINAL_STATES for j in jobs)
+
+    # Real settled payouts: an escrow released on-chain to THIS worker's payout address.
+    # That's actual money received, distinct from the `total_earned` proxy (price of all
+    # docked jobs). Show both so the distinction is honest.
+    payout_addr = (worker.get("sui_address") or "").lower()
+    real_paid = 0.0
+    real_paid_count = 0
+
+    def row(j):
+        jid = j["job_id"]
+        state = j["state"]
+        kind = j.get("kind", "primary")
+        kind_badge = f' <span class="badge kind">{kind}</span>' if kind != "primary" else ""
+        escrow = models.escrow_status(jid)
+        chain = (escrow or {}).get("chain") or {}
+        nonlocal real_paid, real_paid_count
+        paid_cell = "—"
+        if chain.get("release_digest") and (chain.get("paid_to") or "").lower() == payout_addr:
+            real_paid += j.get("price", 0) or 0
+            real_paid_count += 1
+            paid_cell = f'<a href="{_suiscan("tx", chain["release_digest"])}">${j.get("price", 0):g} ✓</a>'
+        elif kind == "verification":
+            paid_cell = '<span class="muted">internal check</span>'
+        elif state in ("disputed", "failed"):
+            paid_cell = '<span class="muted">not paid</span>'
+        return f"""<tr>
+          <td><a class="mono" href="/jobs/{jid}/page">{jid[:8]}</a>{kind_badge}</td>
+          <td>{_state_badge(state)}</td>
+          <td>{_job_total_ligands(j)}</td>
+          <td class="muted">{_age(j.get('started_at') or j.get('created_at'))}</td>
+          <td>{paid_cell}</td>
+        </tr>"""
+
+    rows = "".join(row(j) for j in jobs)  # populates real_paid via nonlocal
+    rows = rows or '<tr><td colspan=5 class="muted">No jobs run yet — leave the daemon running to pick up work.</td></tr>'
+    refresh = '<meta http-equiv="refresh" content="6">' if any_live else ""
+
+    def stat(n, label):
+        return f'<div class="stat"><span class="n">{n}</span><span class="l">{label}</span></div>'
+
     return page(f"Worker {worker_id}", f"""
+    {refresh}
+    <style>.wrap{{max-width:900px}}</style>
     <h1>{worker_id} {badge}</h1>
     <div class="card">
       <p><strong>Hardware:</strong> {worker.get("hardware_info", "unknown")}</p>
-      <p><strong>Sui payout address:</strong> {worker.get("sui_address") or "(none on file — no real payouts)"}</p>
+      <p><strong>Sui payout address:</strong> <span class="mono">{worker.get("sui_address") or "(none on file — no real payouts)"}</span></p>
       <p><strong>Registered:</strong> {worker.get("registered_at", "?")}</p>
-      <div class="stat"><span class="n">{worker.get("jobs_completed", 0)}</span><span class="l">jobs completed</span></div>
-      <div class="stat"><span class="n">{worker.get("total_earned", 0)}</span><span class="l">earned (proxy, not yet real settlement)</span></div>
+    </div>
+    <div class="card">
+      {stat(worker.get("jobs_completed", 0), "jobs completed")}
+      {stat(f"${real_paid:g}", "received on-chain")}
+      {stat(real_paid_count, "paid jobs")}
+      {stat(f"${worker.get('total_earned', 0):g}", "lifetime (incl. proxy)")}
+    </div>
+    <h2>Jobs run by this machine</h2>
+    <div class="card">
+      <table>
+        <tr><th>Job</th><th>State</th><th>Ligands</th><th>Age</th><th>Payout</th></tr>
+        {rows}
+      </table>
     </div>
     """)
 
@@ -777,42 +980,148 @@ def get_worker_json(worker_id: str) -> dict:
     return worker
 
 
+# A researcher's session is just a cookie holding their internal researcher_id, set at
+# sign-in. The user identifies by EMAIL only -- the id is mapped from it server-side and
+# never typed into a form (see create_researcher_identity / get_researcher_by_email).
+SESSION_COOKIE = "rid"
+
+
+def _current_researcher(request: Request) -> dict | None:
+    """The signed-in researcher for this request (from the session cookie), or None."""
+    rid = request.cookies.get(SESSION_COOKIE)
+    return models.get_researcher(rid) if rid else None
+
+
 @app.get("/researchers/signup", response_class=HTMLResponse)
-def researchers_signup_form() -> str:
-    return page("Researcher signup", """
-    <h1>Sign up to submit docking jobs</h1>
-    <p class="lede">Just an email -- no password. Used to track your jobs and spend.</p>
+def researchers_signup_form(request: Request) -> str:
+    # Already signed in? Skip straight to submitting.
+    if _current_researcher(request) is not None:
+        return RedirectResponse("/researchers/submit", status_code=303)
+    wallet_note = (
+        "<p class=\"lede\">You pay with <strong>your own Sui wallet</strong> (Slush / Sui "
+        "Wallet / Suiet browser extension). When you submit a job you'll connect it and "
+        "sign the escrow lock yourself &mdash; we never hold your key. Testnet "
+        "play-money.</p>"
+        if models.SUI_ONCHAIN else
+        "<p class=\"lede\">Escrow is running in off-chain mock mode, so no wallet is "
+        "needed.</p>"
+    )
+    return page("Sign in", f"""
+    <h1>Sign in to submit docking jobs</h1>
+    <p class="lede">Just your email -- no password, no account ID to remember. New email
+    signs you up; a known email signs you back in.</p>
+    {wallet_note}
     <div class="card">
       <form method="post" action="/researchers/signup">
         <label>Email</label>
         <input type="email" name="email" required>
-        <button type="submit">Sign up</button>
+        <button type="submit">Continue</button>
       </form>
     </div>
     """)
 
 
-@app.post("/researchers/signup", response_class=HTMLResponse)
-def researchers_signup_submit(email: str = Form(...)) -> str:
+@app.post("/researchers/signup")
+def researchers_signup_submit(email: str = Form(...)) -> Response:
+    # Sign-up-or-sign-in: maps the email to a (possibly new) researcher_id, then drops the
+    # id into the session cookie so the rest of the UI never has to ask for it.
     identity = models.create_researcher_identity(email)
-    researcher_id = identity["researcher_id"]
-    return page("Signed up", f"""
-    <h1>Signed up: {researcher_id}</h1>
-    <p class="warn"><strong>Save your researcher ID</strong> -- you'll need it to
-    submit jobs: <code>{researcher_id}</code></p>
-    <a class="btn" href="/researchers/submit">Submit a job</a>
+    resp = RedirectResponse("/researchers/submit", status_code=303)
+    resp.set_cookie(SESSION_COOKIE, identity["researcher_id"], httponly=True, samesite="lax")
+    return resp
+
+
+@app.get("/researchers/logout")
+def researchers_logout() -> Response:
+    resp = RedirectResponse("/researchers/signup", status_code=303)
+    resp.delete_cookie(SESSION_COOKIE)
+    return resp
+
+
+def _progress_cell(job: dict) -> str:
+    """Compact progress for a dashboard table cell."""
+    state = job["state"]
+    if state in RESULT_READY_STATES or state in ("proven", "settled"):
+        return '<span class="ok">done</span>'
+    total = _job_total_ligands(job)
+    if state == "running" and total > 1:
+        done = _job_done_ligands(job)
+        return f'{done}/{total}'
+    if state == "running":
+        return "running"
+    return '<span class="muted">—</span>'
+
+
+@app.get("/researchers/jobs", response_class=HTMLResponse)
+def researchers_jobs(request: Request):
+    """The researcher's own 'my jobs' dashboard: every job they've submitted, newest
+    first, with live status/progress and the right next action for each."""
+    researcher = _current_researcher(request)
+    if researcher is None:
+        return RedirectResponse("/researchers/signup", status_code=303)
+    jobs = models.list_researcher_jobs(researcher["researcher_id"])
+    any_live = any(j["state"] not in TERMINAL_STATES for j in jobs)
+
+    spent = sum(j.get("price", 0) for j in jobs
+                if j["state"] in ("settled", "proven", "verifying", "docked"))
+    settled = sum(1 for j in jobs if j["state"] in ("settled", "proven"))
+    running = sum(1 for j in jobs if j["state"] in ("queued", "running", "verifying", "docked"))
+
+    def row(j):
+        jid = j["job_id"]
+        state = j["state"]
+        if state == "pending_payment":
+            action = f'<a href="/jobs/{jid}/pay">Pay &amp; submit</a>'
+        elif state in RESULT_READY_STATES and j.get("result"):
+            action = f'<a href="/jobs/{jid}/download">Download</a>'
+        else:
+            action = f'<a href="/jobs/{jid}/page">View</a>'
+        return f"""<tr>
+          <td><a class="mono" href="/jobs/{jid}/page">{jid[:8]}</a></td>
+          <td>{_state_badge(state)}</td>
+          <td>{_job_total_ligands(j)}</td>
+          <td>{_progress_cell(j)}</td>
+          <td>{('$' + format(j['price'], 'g')) if j.get('price') is not None else '—'}</td>
+          <td class="muted">{_age(j.get('created_at'))}</td>
+          <td class="row-actions">{action}</td>
+        </tr>"""
+
+    rows = "".join(row(j) for j in jobs) or '<tr><td colspan=7 class="muted">No jobs yet — <a href="/researchers/submit">submit one</a>.</td></tr>'
+    refresh = '<meta http-equiv="refresh" content="6">' if any_live else ""
+
+    def stat(n, label):
+        return f'<div class="stat"><span class="n">{n}</span><span class="l">{label}</span></div>'
+
+    return page("My jobs", f"""
+    {refresh}
+    <style>.wrap{{max-width:900px}}</style>
+    <h1>My jobs</h1>
+    <p class="lede">Signed in as <strong>{researcher.get('email','')}</strong> ·
+      <a href="/researchers/submit">submit another</a> · <a href="/researchers/logout">sign out</a></p>
+    <div class="card">
+      {stat(len(jobs), "total")}{stat(running, "in progress")}{stat(settled, "completed")}{stat(f"${spent:g}", "spent")}
+    </div>
+    <div class="card">
+      <table>
+        <tr><th>Job</th><th>State</th><th>Ligands</th><th>Progress</th><th>Price</th><th>Age</th><th></th></tr>
+        {rows}
+      </table>
+    </div>
     """)
 
 
 @app.get("/researchers/submit", response_class=HTMLResponse)
-def researchers_submit_form() -> str:
-    return page("Submit a docking job", """
+def researchers_submit_form(request: Request):
+    researcher = _current_researcher(request)
+    if researcher is None:
+        return RedirectResponse("/researchers/signup", status_code=303)
+    return page("Submit a docking job", f"""
     <h1>Submit a docking job</h1>
+    <p class="lede">Signed in as <strong>{researcher.get('email','')}</strong> ·
+      <a href="/researchers/logout">sign out</a></p>
     <p class="lede">You'll see a price estimate before anything is charged or run.</p>
     <div class="card">
       <form method="post" action="/researchers/submit" enctype="multipart/form-data">
-        <label>Researcher ID <span class="hint">-- no account yet? <a href="/researchers/signup">sign up</a></span></label>
-        <input name="researcher_id" required>
         <label>Protein (PDB file)</label>
         <input type="file" name="receptor_pdb" required>
         <label>Ligands <span class="hint">(one or more SDF files -- each can contain a whole screening library)</span></label>
@@ -834,19 +1143,16 @@ def researchers_submit_form() -> str:
 @app.post("/researchers/submit", response_class=HTMLResponse)
 async def researchers_submit_handler(
     request: Request,
-    researcher_id: str = Form(...),
     receptor_pdb: UploadFile = File(...),
     ligand_sdfs: list[UploadFile] = File(...),
     ref_ligand_sdf: Optional[UploadFile] = File(None),
     center: str = Form(""),
     size: str = Form(""),
-) -> str:
-    if models.get_researcher(researcher_id) is None:
-        return page("Unknown researcher", f"""
-        <h1>Unknown researcher ID</h1>
-        <p>"{researcher_id}" isn't a registered researcher.
-        <a href="/researchers/signup">Sign up</a> first, then try again.</p>
-        """)
+):
+    researcher = _current_researcher(request)
+    if researcher is None:
+        return RedirectResponse("/researchers/signup", status_code=303)
+    researcher_id = researcher["researcher_id"]
 
     pdb_text = (await receptor_pdb.read()).decode()
     ligand_chunks = []
@@ -894,17 +1200,28 @@ async def researchers_submit_handler(
     )
     created = submit_job(job_spec)
     job_id, price = created["job_id"], created["price"]
-    base_url = str(request.base_url).rstrip("/")
+    num_ligands = created.get("num_ligands", count_ligands(ligands_sdf))
+    if models.SUI_ONCHAIN:
+        # Real on-chain settlement: send the researcher to the wallet-connect pay page,
+        # where their own wallet signs the escrow lock. The job queues only after that.
+        action = f"""
+      <p class="lede">Next you'll connect your Sui wallet and lock
+      <strong>${price}</strong> into on-chain escrow. The funds are released to the
+      provider only on a verified result, and refunded to you if the job fails.</p>
+      <a class="btn" href="/jobs/{job_id}/pay">Connect wallet &amp; pay</a>"""
+    else:
+        action = f"""
+      <p class="lede">Nothing runs until you confirm. Payment is off-chain mock
+      bookkeeping in this mode.</p>
+      <form method="post" action="/jobs/{job_id}/confirm-and-redirect">
+        <button type="submit">Confirm &amp; submit</button>
+      </form>"""
     return page("Confirm your job", f"""
     <h1>Ready to submit</h1>
     <div class="card">
-      <p class="lede">{created.get("num_ligands", count_ligands(ligands_sdf))} ligand(s) detected.</p>
+      <p class="lede">{num_ligands} ligand(s) detected.</p>
       <p class="price">${price}</p>
-      <p class="lede">Nothing runs until you confirm. Payment is mock bookkeeping for
-      now -- real Sui settlement is a later phase.</p>
-      <form method="post" action="/jobs/{job_id}/confirm-and-redirect">
-        <button type="submit">Confirm &amp; submit</button>
-      </form>
+      {action}
     </div>
     <p class="lede">Job ID: <code>{job_id}</code></p>
     """)
@@ -925,6 +1242,203 @@ def confirm_job_html(request: Request, job_id: str) -> str:
     """)
 
 
+@app.get("/jobs/{job_id}/pay", response_class=HTMLResponse)
+def pay_page(job_id: str) -> str:
+    """Wallet-connect + sign-the-lock page. The researcher connects their own Sui wallet
+    (Slush / Sui Wallet / Suiet) and signs a transaction that locks the job price into the
+    on-chain escrow -- their coins, their signature, their key never leaves the browser.
+    The created escrow object id is then POSTed to /jobs/{id}/escrow-locked, which verifies
+    the lock on-chain before queueing the job. Vanilla JS + the official @mysten SDKs over
+    the esm.sh CDN, so there's no build step."""
+    job = models.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404)
+    intent = models.payment_intent(job_id)
+    if not intent.get("onchain"):
+        # Off-chain mode has no wallet step -- just confirm.
+        return page("No wallet needed", f"""
+        <h1>Off-chain mode</h1>
+        <div class="card">
+          <p class="lede">Escrow is in off-chain mock mode, so there's no wallet step.</p>
+          <form method="post" action="/jobs/{job_id}/confirm-and-redirect">
+            <button type="submit">Confirm &amp; submit</button>
+          </form>
+        </div>""")
+    price = job.get("price")
+    network = intent["network"]
+    sui = intent["amount_mist"] / 1_000_000_000
+    # The intent values are injected into the page as a JSON blob the script reads. job_id
+    # is an opaque UUID -- safe to embed (no molecule/identity data, per the on-chain rule).
+    intent_json = json.dumps({
+        "jobId": job_id,
+        "packageId": intent["package_id"],
+        "module": intent["module"],
+        "arbiter": intent["arbiter"],
+        "amountMist": str(intent["amount_mist"]),
+        "network": network,
+    })
+    body = f"""
+    <h1>Pay for job</h1>
+    <div class="card">
+      <p class="lede">Lock <strong>{sui:g} SUI</strong> (${price}) into on-chain escrow.
+      Released to the provider only on a verified result; refunded to you if the job fails.
+      <strong>You sign with your own wallet</strong> &mdash; we never hold your key.</p>
+      <p id="status" class="lede">Starting&hellip;</p>
+      <div id="wallets"></div>
+    </div>
+    <p class="lede">Job ID: <code>{job_id}</code></p>
+    <script type="module">
+      const INTENT = {intent_json};
+      const statusEl = document.getElementById('status');
+      const walletsEl = document.getElementById('wallets');
+      const setStatus = (m, cls) => {{ statusEl.textContent = m; statusEl.className = 'lede ' + (cls || ''); }};
+      const log = (...a) => console.log('[pay]', ...a);
+
+      // Surface *anything* that goes wrong so the page can never sit silently "stuck".
+      window.addEventListener('error', e => setStatus('Script error: ' + (e.message || e), 'warn'));
+      window.addEventListener('unhandledrejection', e =>
+        setStatus('Error: ' + ((e.reason && e.reason.message) || e.reason || 'unknown'), 'warn'));
+      setStatus('Loading wallet support…');
+
+      // Load the official @mysten SDKs from the CDN. Both packages are pinned to ONE
+      // @mysten/sui version (1.36.0) so the wallet, the transaction builder and the client
+      // all share a single SDK instance -- the Transaction the wallet receives is exactly
+      // the class it understands. (NOTE: @mysten/sui v2 moved SuiClient/getFullnodeUrl out
+      // of /client, which is what broke the previous attempt with "SDK exports missing".)
+      // `?bundle` collapses the sui subpaths into a single module so there's no slow
+      // request-waterfall that can hang. Each import is raced against a timeout, so a dead
+      // CDN/ad-blocker turns into a visible message instead of an endless spinner.
+      const SUI = '@mysten/sui@1.36.0';
+      const withTimeout = (p, ms, what) => Promise.race([p,
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timed out loading ' + what)), ms))]);
+      const load = (url, what) => withTimeout(import(url), 15000, what);
+
+      let getWallets, Transaction, SuiClient, getFullnodeUrl;
+      try {{
+        const [wstd, txmod, clientmod] = await Promise.all([
+          load('https://esm.sh/@mysten/wallet-standard@0.14.0?deps=' + SUI, 'wallet standard'),
+          load('https://esm.sh/' + SUI + '/transactions?bundle', 'transactions'),
+          load('https://esm.sh/' + SUI + '/client?bundle', 'client'),
+        ]);
+        getWallets = wstd.getWallets;
+        Transaction = txmod.Transaction;
+        SuiClient = clientmod.SuiClient;
+        getFullnodeUrl = clientmod.getFullnodeUrl;
+        const missing = [['getWallets', getWallets], ['Transaction', Transaction],
+          ['SuiClient', SuiClient], ['getFullnodeUrl', getFullnodeUrl]]
+          .filter(([, v]) => !v).map(([k]) => k);
+        if (missing.length) throw new Error('SDK exports missing: ' + missing.join(', '));
+      }} catch (e) {{
+        setStatus('Could not load wallet libraries: ' + (e && e.message ? e.message : e)
+          + '. Disable any ad/script blocker for this page and reload.', 'warn');
+        throw e;
+      }}
+
+      const client = new SuiClient({{ url: getFullnodeUrl(INTENT.network) }});
+      const chain = 'sui:' + INTENT.network;
+
+      function suiWallets() {{
+        return getWallets().get().filter(w =>
+          w.features['standard:connect'] &&
+          (w.features['sui:signAndExecuteTransaction'] || w.features['sui:signTransaction'] ||
+           w.features['sui:signAndExecuteTransactionBlock']));
+      }}
+
+      async function execTx(w, account, tx) {{
+        const f = w.features;
+        if (f['sui:signAndExecuteTransaction'])
+          return await f['sui:signAndExecuteTransaction'].signAndExecuteTransaction({{ transaction: tx, account, chain }});
+        if (f['sui:signTransaction']) {{
+          const signed = await f['sui:signTransaction'].signTransaction({{ transaction: tx, account, chain }});
+          return await client.executeTransactionBlock({{ transactionBlock: signed.bytes, signature: signed.signature }});
+        }}
+        return await f['sui:signAndExecuteTransactionBlock'].signAndExecuteTransactionBlock(
+          {{ transactionBlock: tx, account, chain }});
+      }}
+
+      async function payWith(w) {{
+        for (const b of walletsEl.querySelectorAll('button')) b.disabled = true;
+        try {{
+          setStatus('Connecting to ' + w.name + '… approve the connection in your wallet.');
+          const out = await w.features['standard:connect'].connect();
+          const account = (out && out.accounts && out.accounts[0]) || (w.accounts && w.accounts[0]);
+          if (!account) throw new Error('wallet returned no account');
+          log('connected', account.address);
+
+          setStatus('Building lock transaction…');
+          const tx = new Transaction();
+          tx.setSender(account.address);
+          const [coin] = tx.splitCoins(tx.gas, [BigInt(INTENT.amountMist)]);
+          tx.moveCall({{
+            target: INTENT.packageId + '::' + INTENT.module + '::lock',
+            arguments: [
+              coin,
+              tx.pure.vector('u8', Array.from(new TextEncoder().encode(INTENT.jobId))),
+              tx.pure.address(INTENT.arbiter),
+            ],
+          }});
+
+          setStatus('Approve the payment in your wallet…');
+          const res = await execTx(w, account, tx);
+          const digest = res.digest;
+          log('tx digest', digest);
+          setStatus('Locked. Confirming on-chain (tx ' + digest.slice(0, 10) + '…)…');
+
+          const full = await client.waitForTransaction({{ digest, options: {{ showObjectChanges: true }} }});
+          const created = (full.objectChanges || []).find(
+            o => o.type === 'created' && o.objectType && o.objectType.endsWith('::escrow::Escrow'));
+          if (!created) throw new Error('escrow object not found in tx ' + digest);
+
+          setStatus('Verifying lock with the marketplace…');
+          const r = await fetch('/jobs/' + INTENT.jobId + '/escrow-locked', {{
+            method: 'POST', headers: {{ 'content-type': 'application/json' }},
+            body: JSON.stringify({{ escrow_object_id: created.objectId }}),
+          }});
+          if (!r.ok) throw new Error('backend rejected lock: ' + (await r.text()));
+          setStatus('Paid and queued! Redirecting…', 'ok');
+          window.location = '/jobs/' + INTENT.jobId + '/page';
+        }} catch (e) {{
+          log('error', e);
+          setStatus('Error: ' + (e && e.message ? e.message : e), 'warn');
+          for (const b of walletsEl.querySelectorAll('button')) b.disabled = false;
+        }}
+      }}
+
+      function render() {{
+        const ws = suiWallets();
+        walletsEl.innerHTML = '';
+        if (!ws.length) {{
+          setStatus('No Sui wallet detected. Install Slush / Sui Wallet / Suiet (set to '
+            + INTENT.network + '), then reload this page.', 'warn');
+          return;
+        }}
+        setStatus(ws.length === 1
+          ? 'Wallet detected. Click to pay:'
+          : 'Choose a wallet to pay with:');
+        for (const w of ws) {{
+          const b = document.createElement('button');
+          b.textContent = (ws.length === 1 ? 'Pay with ' : '') + w.name;
+          b.style.marginRight = '8px';
+          b.onclick = () => payWith(w);
+          if (w.icon) {{
+            const img = document.createElement('img');
+            img.src = w.icon; img.width = 18; img.height = 18;
+            img.style.cssText = 'vertical-align:middle;margin-right:6px';
+            b.prepend(img);
+          }}
+          walletsEl.appendChild(b);
+        }}
+      }}
+
+      // Wallets register asynchronously; re-render whenever one appears.
+      getWallets().on('register', render);
+      render();
+      setTimeout(render, 400);
+      setTimeout(render, 1200);
+    </script>"""
+    return page("Pay for job", body)
+
+
 # --------------------------------------------------------------------------------------
 # Admin dashboard -- shared-password gate (ADMIN_PASSWORD env var). Shows business-
 # sensitive data (user lists, hardware, spend/earnings), so it isn't left wide open
@@ -938,6 +1452,11 @@ def _require_admin(credentials: HTTPBasicCredentials = Depends(_admin_auth)) -> 
     expected = os.environ.get("ADMIN_PASSWORD")
     if not expected or not secrets.compare_digest(credentials.password, expected):
         raise HTTPException(status_code=401, detail="invalid admin credentials", headers={"WWW-Authenticate": "Basic"})
+
+
+def _valid_sui_address(addr: str) -> bool:
+    """A Sui address is 0x followed by 64 hex chars (32 bytes)."""
+    return bool(re.fullmatch(r"0x[0-9a-fA-F]{64}", addr or ""))
 
 
 def _short(s: Optional[str], n: int = 8) -> str:
