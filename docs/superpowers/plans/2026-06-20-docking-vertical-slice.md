@@ -367,6 +367,12 @@ git commit -m "feat: docking worker — gnina build/run/parse/rank"
 
 ### Task 5: Proof packager — hash manifest + verify
 
+Note (2026-06-20 revision): `:Storage:` stays the **mock** local-folder implementation
+through this task — the manifest shape needs to be locked down and tested before we
+spend a real Walrus call on it. Task 6 swaps it for real Walrus without changing this
+task's logic, as long as `put`/`get` here are only ever called with the manifest JSON
+(never raw receptor/ligand/pose bytes) — keep that true now so Task 6 is a clean swap.
+
 **Files:**
 - Modify: `plain/docking_marketplace.plain`
 
@@ -414,15 +420,85 @@ git commit -m "feat: proof packager — hash manifest + tamper-evident verify"
 
 ---
 
-### Task 6: Wire the full lifecycle — dispatch, settle, refund-on-failure
+### Task 6: Real chain layer — swap mocked Escrow/Storage for DeepBook/Walrus
 
-Ties every component into the state machine: submit holds escrow, runs the worker, builds+stores the proof, and releases (or refunds) escrow.
+This is the task that turns "decorative Sui imports" into a real, judge-visible role,
+per the SESSION_HANDOFF demo-day note and §11.2 of the design spec. It swaps the
+*implementation* behind the existing `:Escrow:`/`:Storage:` interfaces — callers in
+Tasks 2, 5, and 7 do not change.
+
+**Files:**
+- Modify: `plain/docking_marketplace.plain` (implementation reqs for `:Escrow:`/`:Storage:`, plus new acceptance tests for the confidentiality constraints)
+- Create: `scripts/setup_sui_testnet.sh` (wallet/keypair + testnet SUI/DEEP faucet steps)
+
+**Interfaces:**
+- `:Escrow:` keeps `hold/release/refund/status`, now backed by a real DeepBook pool on
+  testnet: `hold(job_id, amount)` places a generic compute-unit buy order sized to
+  `amount`; `release` settles it (transfers to the supplier address); `refund` cancels
+  it. The order object/event must contain **only** an opaque compute-unit count and
+  price — no `job_id`, receptor, or ligand data.
+- `:Storage:` keeps `put(blob) -> blob_id` / `get(blob_id) -> blob`, now backed by real
+  Walrus testnet HTTP publisher/aggregator calls. `put` is only ever invoked with the
+  proof manifest JSON from Task 5 (not raw molecule files).
+
+- [ ] **Step 1: Stand up a Sui testnet identity**
+
+Create a testnet keypair (`sui client new-address ed25519` or equivalent), fund it from
+the testnet faucet (SUI + enough for a DEEP/USDC-pool test order if DEEP isn't free),
+and confirm an existing DeepBook testnet pool you can place a small order against.
+Record the pool ID, keypair location (gitignored), and faucet steps in
+`scripts/setup_sui_testnet.sh`.
+
+- [ ] **Step 2: Real Walrus `put`/`get`**
+
+Implement `:Storage:` against Walrus's testnet HTTP publisher (`PUT` blob, get back a
+blob ID) and aggregator (`GET` by blob ID) endpoints — no Sui SDK required for this
+part, just HTTP. Keep the mock implementation available behind a config flag for fast
+local test runs; the acceptance tests below must run against the real endpoint at least
+once.
+
+  ***acceptance tests***
+
+  - `put(manifest_bytes)` against the real Walrus testnet returns a blob ID, and `get`
+    of that ID returns the same bytes.
+  - `put` is never called anywhere in the codebase with raw receptor/ligand/pose file
+    bytes — only with the proof manifest JSON. (Enforce via a focused unit test on the
+    call sites, since this is a "never do X" constraint conformance can't observe
+    structurally.)
+
+- [ ] **Step 3: Real DeepBook-backed Escrow**
+
+Implement `hold`/`release`/`refund` as real signed Sui transactions against the testnet
+DeepBook pool from Step 1, sized generically by compute-units (derive a compute-unit
+estimate from `params.exhaustiveness * num_ligands`, not from anything job-identifying).
+
+  ***acceptance tests***
+
+  - `hold(job_id, amount)` produces a real on-chain order; `status(job_id)` reflects
+    `held` by reading the order's on-chain state, not a local flag.
+  - The on-chain order data contains no `job_id`, receptor, or ligand identifiers —
+    only a compute-unit count and price (assert by reading back the raw order object).
+  - `release`/`refund` correctly settle/cancel the real order.
+
+- [ ] **Step 4: Render, verify, commit**
+
+```bash
+bash scripts/render.sh docking_marketplace.plain --render-from <N>
+git add plain/ scripts/setup_sui_testnet.sh
+git commit -m "feat: real DeepBook escrow + real Walrus storage behind existing interfaces"
+```
+
+---
+
+### Task 7: Wire the full lifecycle — dispatch, settle, refund-on-failure
+
+Ties every component into the state machine: submit holds escrow, runs the worker, builds+stores the proof, and releases (or refunds) escrow. By this point `:Escrow:`/`:Storage:` are the real Task 6 implementations, not mocks.
 
 **Files:**
 - Modify: `plain/docking_marketplace.plain`
 
 **Interfaces:**
-- Consumes: Tasks 2–5 (`POST /jobs`, `:Escrow:`, `:Storage:`, worker `dock`, proof `build_proof`/`verify_proof`).
+- Consumes: Tasks 2–6 (`POST /jobs`, `:Escrow:`, `:Storage:`, worker `dock`, proof `build_proof`/`verify_proof`).
 - Produces:
   - `GET /jobs/{id}/result` → `:DockResult:` JSON (200 once `state ≥ docked`, else 409).
   - `GET /jobs/{id}/proof` → the stored `:Proof:` JSON (200 once `state ≥ proven`, else 409).
@@ -475,21 +551,74 @@ git commit -m "feat: full docking lifecycle — dispatch, settle, refund-on-fail
 
 ---
 
+### Task 8 (stretch): Dispatch the worker to a separate process/host
+
+Only attempt this if Tasks 0–7 land with time to spare. Per design spec §11.1, nothing
+before this task actually demonstrates "idle compute" — the worker has run in-process
+on the API host the whole time. This task is the minimal real step toward that claim:
+run the docking worker as a **separate process reachable over HTTP** (can still be on
+the same physical machine for the demo — the point is the dispatch boundary, not
+physical distance), so `payment.supplier_id` refers to something real.
+
+**Files:**
+- Modify: `plain/docking_marketplace.plain` (`:WorkerDispatch:` interface, replacing the
+  in-process call from Task 4 with an HTTP call to a worker service)
+- Create: a minimal worker HTTP service (could itself be Codeplain-authored, or a thin
+  hand-written shim if time is short — judge by remaining time, not purity)
+
+**Interfaces:**
+- `:WorkerDispatch:` — `dispatch(job_spec) -> DockResult`, implemented in Task 4 as a
+  direct function call. This task changes the implementation to an HTTP POST to a
+  separate worker process (`POST /dock` on a second port/host), with the API polling or
+  awaiting the response. The job lifecycle (Task 7) should not need to change — it
+  already calls through `:WorkerDispatch:`, not gnina directly.
+
+- [ ] **Step 1: Extract the worker into its own runnable service**
+
+Stand up the Task 4 worker logic behind its own `POST /dock` endpoint, runnable as an
+independent process (own venv/container if useful, but same gnina binary).
+
+  ***acceptance tests***
+
+  - Calling `POST /dock` directly on the worker service with a fixture job spec returns
+    the same `:DockResult:` shape Task 4 produced in-process.
+
+- [ ] **Step 2: Point the API's `:WorkerDispatch:` at the worker service over HTTP**
+
+  ***acceptance tests***
+
+  - A full job submitted via `POST /jobs` against the main API still reaches `settled`,
+    now via an HTTP call to the separate worker process (verify by, e.g., checking the
+    worker process's own log/PID differs from the API's).
+  - If the worker process is killed mid-job, the job reaches `failed` (not stuck) and
+    `Escrow.refund` is called — the dispatch boundary must fail closed, not hang.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add plain/
+git commit -m "feat: dispatch docking worker to a separate process (idle-compute boundary, stretch)"
+```
+
+---
+
 ## Self-Review
 
 **Spec coverage** (against `2026-06-20-docking-vertical-slice-design.md`):
-- §3 architecture (API, worker, proof, mock chain) → Tasks 1–6. ✓
-- §4.1 Job Lifecycle API + state machine → Tasks 2, 6. ✓
-- §4.2 Docking Worker → Task 4. ✓
+- §3 architecture (API, worker, proof, chain layer) → Tasks 1–7. ✓
+- §4.1 Job Lifecycle API + state machine → Tasks 2, 7. ✓
+- §4.2 Docking Worker → Task 4 (dispatch boundary: Task 8, stretch). ✓
 - §4.3 Proof Packager (build + verify) → Task 5. ✓
-- §4.4 Mock Chain (Escrow + Storage, release gated on proof) → Task 3 (+ gating exercised in Task 6). ✓
+- §4.4 Chain Layer (Escrow + Storage, mocked → real, release gated on proof) → Task 3 (mocks), Task 6 (real DeepBook/Walrus), gating exercised in Task 7. ✓
 - §5 data contracts (Job spec, Result, Proof) → Tasks 2, 4, 5. ✓
-- §6 data flow happy path → Task 6. ✓
-- §7 error handling (gnina failure→refund, bad input→4xx pre-hold, determinism) → Tasks 2, 4, 5, 6. ✓
-- §8 testing (all 5 acceptance scenarios) → distributed across Tasks 2,4,5,6. ✓
-- §9 runtime (WSL, Python 3.11+, gnina external, commit `.plain`) → Global Constraints + Task 0. ✓
-- §10 risks (subprocess misfire→strong acceptance tests; GPU fragility→CPU fallback; gnina smoke before wiring) → Task 0, Task 4. ✓
+- §6 data flow happy path → Task 7. ✓
+- §7 error handling (gnina failure→refund, bad input→4xx pre-hold, determinism) → Tasks 2, 4, 5, 7. ✓
+- §11.1 idle-compute gap → Task 8 (stretch; explicitly not assumed done). ✓
+- §11.2 confidentiality constraints (no job data on-chain/in Walrus, no provider-side secrecy claim) → Task 6 acceptance tests. ✓
+- §8 testing (all 5 acceptance scenarios) → distributed across Tasks 2, 4, 5, 7. ✓
+- §9 runtime (WSL, Python 3.11+, gnina external, commit `.plain`) → Global Constraints + Task 0. (Also verified to run native-Linux/CPU-only, see SESSION_HANDOFF §4a.) ✓
+- §10 risks (subprocess misfire→strong acceptance tests; GPU fragility→CPU fallback; gnina smoke before wiring; mocked-Sui demo risk; idle-compute gap) → Task 0, Task 4, Task 6, Task 8. ✓
 
 **Placeholder scan:** Template import name in Task 1 is the one genuine unknown; Task 0 Step 6 resolves it empirically and Task 1 instructs substitution. No `TBD`/`TODO`/"handle edge cases" left.
 
-**Type consistency:** `DockResult` record fields (`ligand_id, cnn_score, cnn_affinity, vina_affinity, pose_path`) are identical in Tasks 4, 5, 6. `Proof` fields (`receptor_sha256, ligand_sha256s, params, gnina_version, pose_sha256s, timestamp, worker_id, manifest_sha256`) are identical in Tasks 5, 6. Escrow states (`held/released/refunded`) and job states (`queued/running/docked/proven/settled/failed`) are consistent across Tasks 2, 3, 6.
+**Type consistency:** `DockResult` record fields (`ligand_id, cnn_score, cnn_affinity, vina_affinity, pose_path`) are identical in Tasks 4, 5, 7. `Proof` fields (`receptor_sha256, ligand_sha256s, params, gnina_version, pose_sha256s, timestamp, worker_id, manifest_sha256`) are identical in Tasks 5, 7. Escrow states (`held/released/refunded`) and job states (`queued/running/docked/proven/settled/failed`) are consistent across Tasks 2, 3, 6, 7.

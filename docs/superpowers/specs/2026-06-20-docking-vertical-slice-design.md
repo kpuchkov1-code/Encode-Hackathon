@@ -3,7 +3,14 @@
 **Date:** 2026-06-20
 **Status:** Approved (brainstorming), pending implementation plan
 **Repo:** https://github.com/kpuchkov1-code/Encode-Hackathon
-**Hackathon:** Encode Vibe Coding Hackathon (3 days, AI-only build). Bounties targeted by the wider project: Solvimon, Codeplain, Sui (DeepBook & Walrus), Vercel. This spec covers **only the docking vertical slice**.
+**Hackathon:** Encode Vibe Coding Hackathon (3 days, AI-only build). Bounties targeted by the wider project: Solvimon, ~~Codeplain~~, Sui (DeepBook & Walrus), Vercel. This spec covers **only the docking vertical slice**.
+
+**Update 2026-06-20:** Codeplain has been dropped (see `SESSION_HANDOFF.md` §7) after
+render-loop friction (a path bug, then real CPU docking runs blowing past the 120s
+conformance-test timeout) made it slower than hand-writing the same logic. The backend
+is now hand-written Python. References to ".plain specs" / "rendered" below describe
+the original plan, not the current build — kept for historical context, not as
+instructions to follow.
 
 ---
 
@@ -28,7 +35,8 @@ This slice is authored **primarily in Codeplain `.plain` specs**, rendered to Py
 | Engine runtime | External binary in **WSL2**, CPU fallback | gnina is Linux-native; WSL GPU passthrough already available |
 | Demo workload | Deferred / parameterized | Worker takes any target + ligand set; specific molecules chosen on demo day. Nothing reused from prior projects |
 | Build tool | **Codeplain `.plain`** authors backend (API + worker wrapper + proof packager + mock chain), maximize Codeplain coverage | Genuine primary use for the Codeplain bounty; subprocess+parsing+hashing is bounded, acceptance-testable logic |
-| Chain layer | Mocked behind interfaces | Real Sui/DeepBook/Walrus deferred to later phase |
+| Chain layer | Mocked behind interfaces **through Task 5**, then real for Task 6+ | Local mocks (JSON ledger, local blob folder) get the interfaces stable and testable fast, but the demo-day judging requirement is a *visible, non-decorative* Sui role for both DeepBook and Walrus — so the plan now swaps each mock for a thin real implementation once the interface shape is locked (see §11) |
+| Idle-compute marketplace | **Not built in this slice; explicit gap** | The worker runs in-process on the API host through Task 7. There is no second party, no untrusted hardware, no matching. `supplier_id` is currently just a string field. Task 8 (stretch) is the first real step toward demonstrating the actual marketplace premise — see §11 |
 
 ---
 
@@ -91,10 +99,21 @@ Each component has one clear purpose, a well-defined interface, and is independe
 - Serializes the manifest to canonical JSON and hashes it → that hash is the **proof of execution**.
 - Provides a `verify(manifest, artifacts)` function that recomputes hashes and confirms integrity.
 
-### 4.4 Mock Chain Layer
-- Two interfaces, mock implementations now, real Sui impls later:
-  - **`Escrow`**: `hold(job_id, amount)`, `release(job_id, proof)`, `refund(job_id)` — backed by a local JSON ledger.
-  - **`Storage`** (Walrus stand-in): `put(blob) -> blob_id`, `get(blob_id)` — backed by a local blob folder.
+### 4.4 Chain Layer (mocked through Task 5, real from Task 6)
+- Two interfaces. Mock implementations land first (Task 3) so the rest of the system
+  has something stable to build against; each gets swapped for a real Sui-backed
+  implementation in Task 6, behind the *same* interface (callers in Tasks 2/5/7 don't
+  change):
+  - **`Escrow`**: `hold(job_id, amount)`, `release(job_id, proof)`, `refund(job_id)`,
+    `status(job_id)`. Mock: local JSON ledger. Real: a thin DeepBook-backed
+    implementation — `hold` places a generic "compute-unit" buy order sized to the
+    job's `payment.amount` on a DeepBook pool (testnet); `release`/`refund` settle or
+    cancel it. The on-chain order **never carries job-identifying data** — only an
+    opaque compute-unit count and price (see §11.2).
+  - **`Storage`** (Walrus stand-in): `put(blob) -> blob_id`, `get(blob_id)`. Mock: local
+    blob folder. Real: Walrus testnet HTTP publisher/aggregator endpoints. Per §11.2,
+    `put` is **only ever called with the proof manifest** (hashes + metadata, KB-sized)
+    — never the raw receptor/ligand/pose files. Those stay in regular local/job storage.
 - Release is **gated on a valid proof**; an invalid/missing proof can only refund, never release.
 
 ---
@@ -166,5 +185,46 @@ Acceptance tests are written **into the `.plain` specs** so Codeplain's conforma
 ## 10. Risks
 
 1. **Generated subprocess call to a finicky GPU binary can silently misfire.** Mitigation: strong, specific acceptance tests in the `.plain` (§8) so conformance catches it instead of hand-debugging.
-2. **gnina GPU setup in WSL is environment-sensitive.** Mitigation: CPU fallback path; verify the gnina install with a one-ligand smoke test before wiring the API.
+2. **gnina GPU setup in WSL is environment-sensitive.** Mitigation: CPU fallback path; verify the gnina install with a one-ligand smoke test before wiring the API. (Confirmed working CPU-only on a second, native-Linux machine with no GPU at all — see `SESSION_HANDOFF.md` §4a.)
 3. **Codeplain may struggle with the messiest parts of the worker.** Mitigation: keep gnina as an external binary (not generated); only the bounded command-build/parse/hash logic is specified.
+4. **Demo-day judging needs a *visible* DeepBook/Walrus role; pure mocks risk failing that bar.** Mitigation: Task 6 swaps both mocks for thin real implementations (§11.2) once the interface is proven against the mocks — real calls happen, but only against a generic compute-unit/hash-manifest surface, not full job data.
+5. **The "idle compute marketplace" premise isn't demonstrated by Tasks 0-7.** Accepted gap, not hidden — see §11.1. Task 8 is the minimal real fix if time allows; otherwise the demo narrative must be honest about what this slice actually proves.
+
+## 11. Reconciliation with the wider marketplace design (added 2026-06-20)
+
+These decisions came out of a separate design discussion for the full platform (idle
+compute → provider-agent → DeepBook-matched marketplace → Walrus-anchored proofs). Most
+of that design is out of scope for this 3-day slice, but two things from it are adopted
+here because they're either cheap to do now or risky to skip.
+
+### 11.1 The marketplace gap (acknowledged, not fixed by default)
+
+The original platform premise is "pay someone else for their idle compute." This slice's
+worker runs in-process on the same host as the API — there is no second party, no
+untrusted hardware boundary, no matching. `payment.supplier_id` is decorative until
+Task 8 (stretch: dispatch the worker to a second process/host over HTTP). If Task 8
+doesn't happen, say so plainly in the demo rather than implying the marketplace exists.
+
+### 11.2 Confidentiality constraints carried into the real chain layer (Task 6)
+
+Two decisions from the wider design apply directly to how `Escrow`/`Storage` go real,
+and are written as acceptance-test constraints, not just prose:
+
+- **Provider-side confidentiality is not claimed.** Whoever runs the worker (even just
+  "us," until Task 8) can see the job's plaintext receptor/ligand data — gnina needs it
+  in plaintext to compute anything, and there's no TEE requirement in this slice. Job
+  input/output files are deleted from local storage after a job settles or fails (not
+  retained indefinitely), and this limitation should be stated plainly to any user of
+  the demo, not implied away.
+- **Nothing job-identifying ever touches Sui or Walrus.** Both are public-by-default —
+  anyone with a blob ID or watching the chain can read what's there. So:
+  - DeepBook orders (real, Task 6) carry only an opaque compute-unit count and price —
+    never the receptor/ligand identity or any job metadata.
+  - Walrus `put` (real, Task 6) is only ever called with the proof manifest (sha256
+    hashes + params + timestamp — see §4.3), never the raw receptor/ligand/pose bytes.
+    Those stay in local job storage, off-chain, for the lifetime of the job.
+  - If a future task needs to push full artifacts to Walrus for independent
+    verification/dispute, they must be encrypted client-side first, with the key shared
+    out-of-band — never put the key or the plaintext on-chain. Not needed in this slice
+    (single executor, no disputing party yet), but don't violate it by accident when
+    extending Storage usage later.

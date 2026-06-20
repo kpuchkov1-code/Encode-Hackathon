@@ -5,9 +5,9 @@
 - :Endpoint: is an HTTP endpoint of :App:.
 
 - :JobSpec: is the JSON request body that describes a docking job. It is an object with these fields:
-  - `receptor`: an object containing either a `pdb_id` string or a `file` string.
-  - `ligands`: a non-empty array of objects, each having an `id` string and either a `smiles` string or an `sdf` string.
-  - `box`: an object containing either an `autobox_ligand` string, or both a `center` array of three numbers and a `size` array of three numbers.
+  - `receptor`: an object containing either a `pdb_id` string (a 4-character RCSB PDB identifier, fetched by :App: from the RCSB PDB web service) or a `file` string (the raw contents of a PDB file, given inline as text).
+  - `ligands`: a non-empty array of objects, each having an `id` string and either a `smiles` string or an `sdf` string (the raw contents of an SDF file containing one 3D molecule, given inline as text).
+  - `box`: an object containing either an `autobox_ligand` string (the raw contents of an SDF file containing one reference ligand molecule, given inline as text, used to derive the docking search box) or both a `center` array of three numbers and a `size` array of three numbers.
   - `params`: an object with `exhaustiveness` (integer), `num_modes` (integer), `cnn` (string), and `seed` (integer).
   - `payment`: an object with `amount` (number) and `supplier_id` (string).
 
@@ -16,6 +16,14 @@
 - :Job: is a persisted docking job record with these fields: `job_id` (a UUID string), `state` (a :JobState:), `reason` (a string that is empty unless the state is "failed"), `created_at` (an ISO 8601 timestamp string), and the submitted :JobSpec:.
 
 - :Escrow: is a per-job payment hold, and is a stand-in for on-chain DeepBook settlement. For each :Job: it tracks an escrow state that is one of "held", "released", or "refunded", together with the held `amount` and the `supplier_id` taken from the job's `payment`. Payment is held when the job is created, is released only against a valid proof of execution, and is refunded if the job fails.
+
+- :ReceptorPrep: produces a receptor PDB file ready for docking from a :JobSpec:'s `receptor` field. If `pdb_id` is given, :ReceptorPrep: fetches that structure from the RCSB PDB web service and writes it to a file. If `file` is given, its contents are written directly to a file. In both cases :ReceptorPrep: then strips the file to standard protein `ATOM` records only, discarding waters and any other heteroatoms, before it is used.
+
+- :LigandPrep: produces a 3D SDF file for one ligand of a :JobSpec:, ready for docking, using RDKit (never OpenBabel). If the ligand provides `sdf`, its contents are written directly to a file and used as-is. If the ligand provides `smiles`, :LigandPrep: parses the SMILES with RDKit, adds explicit hydrogens, embeds a 3D conformer, performs an MMFF94 energy minimization, and writes the resulting molecule to a file. :LigandPrep: raises an error for a ligand whose `smiles` RDKit cannot parse or embed.
+
+- :GninaCommand: is the argument vector used to dock one prepared ligand against a prepared receptor: the command named "gninaw", resolved via the process's `PATH` environment variable (never the bare "gnina" binary directly, and never a path relative to the current working directory, because "gninaw" is a wrapper that sets the dynamic library search path the real gnina binary requires, and it is only guaranteed to be found via `PATH`), with `-r` set to the :ReceptorPrep: output, `-l` set to the :LigandPrep: output, box arguments derived from the :JobSpec:'s `box` field (`--autobox_ligand` with the reference ligand file if given, otherwise `--center_x`/`--center_y`/`--center_z` and `--size_x`/`--size_y`/`--size_z` derived from `center`/`size`), `--seed` set to `params.seed`, `--num_modes` set to `params.num_modes`, `--exhaustiveness` set to `params.exhaustiveness`, and `-o` set to a per-ligand output SDF path. :GninaCommand: includes `--no_gpu` whenever no GPU is available on the host running :App:.
+
+- :DockResult: is a list of per-ligand docking outcomes for a job, ranked best-first by descending `cnn_affinity` among the successfully docked ligands. Each successfully docked ligand is represented as an object with `ligand_id` (string), `cnn_score` (number), `cnn_affinity` (number), `vina_affinity` (number), and `pose_path` (string), parsed from the best-scoring pose in the output SDF produced by that ligand's :GninaCommand: (the SDF properties named "CNNscore", "CNNaffinity", and "minimizedAffinity" respectively). A ligand whose :LigandPrep: or :GninaCommand: fails is instead represented as an object with `ligand_id` (string) and `error` (a non-empty string describing the failure), and does not prevent the other ligands in the same job from being processed. :DockResult: entries with an `error` are ranked after all successfully docked entries.
 
 ***implementation reqs***
 
@@ -30,6 +38,10 @@
 - :App: should persist :Job: records in a SQLite database stored in a local file. The database file path should default to "jobs.db" and be configurable through the `DOCKING_DB_PATH` environment variable. The database schema should be created automatically on startup if it does not already exist.
 
 - :App: should record :Escrow: state in a JSON ledger file, defaulting to "escrow_ledger.json" and configurable through the `DOCKING_ESCROW_PATH` environment variable. The ledger maps each `job_id` to its escrow record.
+
+- :App: should detect whether an NVIDIA GPU is available on the host it runs on, and include `--no_gpu` in every :GninaCommand: when none is found.
+
+- :App: should write all :ReceptorPrep: and :LigandPrep: intermediate files, and all gnina output SDF files, under a per-job working directory so concurrent jobs cannot overwrite each other's files.
 
 ***test reqs***
 
@@ -70,3 +82,17 @@
   - After a successful "POST /jobs" request, a "GET /jobs/<job_id>/escrow" request for that job returns HTTP status 200, a `state` of "held", and an `amount` equal to the submitted `payment.amount`.
 
   - A "GET /jobs/<job_id>/escrow" request for a `job_id` that does not exist returns HTTP status 404.
+
+- Implement :Endpoint: "POST /jobs/<job_id>/run" that, for a :Job: in state "queued", runs :ReceptorPrep: once and then, for each ligand in the job's :JobSpec:, runs :LigandPrep: followed by that ligand's :GninaCommand:, builds the resulting :DockResult:, persists it on the :Job:, transitions the :Job: to state "docked", and returns HTTP status 200 with the :DockResult: as a JSON array. If the :Job: does not exist, it returns HTTP status 404. If the :Job: exists but is not in state "queued", it returns HTTP status 409 and makes no change.
+
+  ***acceptance tests***
+
+  - After creating a job via "POST /jobs" whose :JobSpec: has the fixture receptor (`fixtures/receptor.pdb` as `file`) and a single ligand (`fixtures/ligand_active.sdf` contents as `sdf`) with `box.autobox_ligand` set to the contents of `fixtures/ref_ligand.sdf`, "POST /jobs/<job_id>/run" returns HTTP status 200 with a :DockResult: containing exactly one entry whose `cnn_affinity` is a finite number and whose `pose_path` names an existing file.
+
+  - For a job whose :JobSpec: has two ligands — the contents of `fixtures/ligand_active.sdf` and the contents of `fixtures/ligand_decoy.sdf`, both as `sdf` — "POST /jobs/<job_id>/run" returns a :DockResult: in which the active ligand's `cnn_affinity` is greater than the decoy ligand's `cnn_affinity`.
+
+  - Calling "POST /jobs/<job_id>/run" a second time on the same job, after it has already transitioned to "docked", returns HTTP status 409.
+
+  - "POST /jobs/<an unknown job_id>/run" returns HTTP status 404.
+
+  - For a job with one ligand given a `smiles` value that RDKit cannot parse (for example, the string "not-a-valid-smiles") and one ligand given the contents of `fixtures/ligand_active.sdf` as `sdf`, "POST /jobs/<job_id>/run" still returns HTTP status 200, the :Job: still reaches state "docked", the unparsable ligand's entry in :DockResult: has a non-empty `error` and no `cnn_affinity`, and the other ligand's entry has a finite `cnn_affinity`.

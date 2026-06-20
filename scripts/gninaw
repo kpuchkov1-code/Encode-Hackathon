@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Wrapper for the gnina binary: it dynamically links against CUDA/cuDNN .so
+# files even when running CPU-only (--no_gpu), so we point LD_LIBRARY_PATH at
+# the pip-installed nvidia-*-cu12 wheels (which ship the .so files) instead of
+# requiring a real GPU driver/toolkit on this machine.
+set -euo pipefail
+# Installed both at <repo>/scripts/gninaw and on PATH at <repo>/.venv/bin/gninaw (so it
+# resolves the same way regardless of the caller's cwd -- Codeplain's conformance runner
+# copies the build into a different working directory, where a relative
+# "scripts/gninaw" path would not exist). Find the venv root via $VIRTUAL_ENV when
+# activated, falling back to this script's own location otherwise.
+if [ -n "${VIRTUAL_ENV:-}" ]; then
+  VENV_ROOT="$VIRTUAL_ENV"
+else
+  VENV_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.venv"
+fi
+LIBDIRS="$(cat "$VENV_ROOT/gnina_libdirs.txt")"
+export LD_LIBRARY_PATH="$LIBDIRS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec "$HOME/.local/bin/gnina" "$@"

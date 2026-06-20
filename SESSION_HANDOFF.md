@@ -36,7 +36,7 @@ CNN affinity scores from gnina), not a hollow UI moving fake job IDs around.
 | **Sui — DeepBook** | On-chain payment/escrow/settlement. Currently **mocked** (`:Escrow:`, JSON ledger). Real DeepBook swaps in later behind the same interface. | escrow layer |
 | **Sui — Walrus** | Decentralized storage for job provenance (proof blobs). Currently **mocked** (`:Storage:`, content-addressed local folder — to be built in Task 5). | proof/storage layer |
 | **Solvimon** | Usage-based billing/metering of the marketplace take-rate (10–20%). Not in the docking slice; later phase. | deferred |
-| **Vercel / v0** | Frontend (job submission UI, dashboards). Separate workstream, not this backend. | deferred |
+| **Vercel / v0** | Frontend (job submission UI, dashboards). Separate workstream, not this backend — Kirill builds it. Design now defined: `docs/superpowers/specs/2026-06-20-frontend-job-submission-design.md`. | defined, deferred (Kirill's build) |
 
 Demo-day judging notes: Sui = demo-first, both DeepBook + Walrus need *visible* roles
 (no decorative imports). Codeplain = judges check for real `.plain` usage. Solvimon =
@@ -79,6 +79,31 @@ All of this lives inside **WSL2 Ubuntu** (not the default `docker-desktop` distr
 
 Re-create gnina runtime if needed: `scripts/setup_gnina_env.sh` then `scripts/finalize_gnina.sh`.
 Re-create web deps: `scripts/setup_web_deps.sh`.
+
+## 4a. Native Linux environment (Ali's machine — no WSL, no GPU)
+
+A second contributor is on native Ubuntu 24.04 with no NVIDIA GPU (Intel iGPU only) and
+~20GB free disk. Fully working as of 2026-06-20:
+
+- **gnina**: prebuilt `gnina.1.3.2` binary (non-CUDA-bundle variant) downloaded from
+  GitHub releases to `~/.local/bin/gnina`. It still dynamically links `libcudnn.so.9`
+  etc. even for CPU-only runs, so it's never called bare — always via
+  `scripts/gninaw`, which sets `LD_LIBRARY_PATH` to the `nvidia-*-cu12` pip wheels
+  (installed into `.venv` purely for their `.so` files, no actual GPU/driver needed).
+  Run with `--no_gpu`. Verified bit-for-bit consistent with the recorded WSL/GPU smoke
+  result (`fixtures/README.md`): active ligand CNNaffinity 3.820 vs decoy 2.616.
+- **Python**: `python3 -m venv .venv` (needed `sudo apt install python3.12-venv` first —
+  Debian ships Python without `ensurepip`/pip by default). `.venv` has flask, rdkit,
+  numpy, requests, plus the Codeplain client's own deps, plus the nvidia `-cu12` wheels
+  above (~2.5GB combined — only installed for their shared libraries).
+- **Codeplain**: NOT using the cloned `~/plain2code_client` path at all — there's a
+  separate, simpler `codeplain` CLI (`uv tool install codeplain`, v0.3.4) already on
+  PATH with `CODEPLAIN_API_KEY` exported from `~/.bashrc`. `scripts/render.sh` now
+  auto-detects which of the two toolchains (WSL `plain2code_client`+`.env`, or native
+  `codeplain` CLI+env-var key) is present and uses whichever is available — keep it
+  portable when editing.
+- `scripts/gninaw` and the updated `scripts/render.sh` are committed; both dev setups
+  use the same entry points.
 
 ## 5. The Codeplain workflow (how to build each task)
 
@@ -155,6 +180,24 @@ Task 4 adds functionality 5+.
 
 ## 7. Progress status
 
+**Codeplain dropped 2026-06-20.** After repeated friction rendering Task 4 (a relative-
+path bug in the generated gnina invocation, then a 120s conformance-test timeout from
+real CPU-only docking runs, each costing real render credits to discover) it became
+clear the render loop was slowing down de-risking the actual product logic more than it
+was helping. **Decision: stop using Codeplain entirely, hand-write the backend in
+Python from here on.** This means **giving up eligibility for the Codeplain bounty** —
+accepted tradeoff, not an oversight. `docking_marketplace.plain` is left in the repo as
+a historical design reference (its `:JobSpec:`/`:Job:`/`:Escrow:` shapes are still a
+reasonable contract) but is no longer the executable source of truth and won't be kept
+in sync with the hand-written code going forward.
+
+**Plan revised 2026-06-20** after reconciling against the wider marketplace design
+(separate doc thread): engine stays **gnina**, but the chain layer now moves to *real*
+DeepBook/Walrus calls instead of staying mocked forever, and two confidentiality
+constraints from that design get baked in as acceptance tests rather than left implicit.
+See `docs/superpowers/specs/2026-06-20-docking-vertical-slice-design.md` §2/§4.4/§11 for
+the full rationale. Native-Linux dev environment (no WSL) also now works — see §4a.
+
 | Task | What | Status |
 |---|---|---|
 | 0 | WSL env, gnina GPU runtime, fixtures, smoke, Codeplain mechanics | ✅ done |
@@ -162,11 +205,28 @@ Task 4 adds functionality 5+.
 | 2 | `:JobSpec:` validation, `:JobState:` machine, SQLite, `POST /jobs` + `GET /jobs/<id>` | ✅ done (smoke-verified) |
 | 3 | `:Escrow:` hold-on-submit + `GET /jobs/<id>/escrow` (JSON ledger, DeepBook stub) | ✅ done (conformance green; not yet manually smoked) |
 | 4 | **Docking worker: gnina build/run/parse/rank** (the scientific core) | ⬜ NEXT |
-| 5 | Proof packager (hash manifest + verify) + `:Storage:` (Walrus stub) | ⬜ |
-| 6 | Full lifecycle: dispatch worker, settle on proof, refund on failure; `GET /jobs/<id>/result` + `/proof` | ⬜ |
+| 5 | Proof packager (hash manifest + verify), `:Storage:` interface (still mocked here) | ⬜ |
+| 6 | **Real chain layer:** swap `:Storage:` mock for real Walrus testnet calls (manifest hashes only — never raw protein/ligand/pose bytes); swap `:Escrow:` mock for a thin real DeepBook-backed hold/release/refund (orders carry only opaque compute-unit count + price, never job metadata) | ⬜ |
+| 7 | Full lifecycle wiring against the now-real Escrow/Storage; `GET /jobs/<id>/result` + `/proof` | ⬜ |
+| 8 | *(stretch)* Run the docking worker as a separately-dispatched process/host reachable over HTTP, instead of an in-process call — the first real step toward the actual "idle compute" marketplace claim, which nothing before this task demonstrates | ⬜ |
 
 Note: `:Storage:` (Walrus stand-in) was intentionally deferred from Task 3 to Task 5,
-where it is actually used (storing proofs) and therefore testable.
+where it is actually used (storing proofs) and therefore testable. It stays mocked
+through Task 5 and only becomes real Walrus in Task 6, once the manifest shape (and the
+constraint on what's allowed to ever touch it) is locked down.
+
+**Known gap, accepted for now:** through Task 7, the "idle compute marketplace" premise
+isn't actually demonstrated — the worker runs in-process on the same machine as the API.
+Task 8 is the (stretch) fix. If time runs out before Task 8, be explicit in the demo that
+this slice proves *verifiable docking + real settlement*, not yet *multi-party compute
+matching*.
+
+**New backend dependency from the frontend design:** Kirill's frontend needs a
+`POST /jobs/estimate` endpoint (job-spec-shaped input, returns a cost estimate, no escrow
+hold, no job created) that isn't in any task above yet — add it to the `.plain` spec
+alongside Task 2 (it only needs `:JobSpec:` validation, not the state machine) before the
+frontend needs to integrate against it. See the frontend design doc §2 for the exact
+shape.
 
 ## 8. Doing Task 4 next (guidance, not gospel)
 
