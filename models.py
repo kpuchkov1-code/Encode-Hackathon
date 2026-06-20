@@ -68,7 +68,12 @@ def _sui(op: str, payload: dict) -> dict:
         raise RuntimeError(f"sui bridge {op} error: {data['error']}")
     return data
 
-VALID_STATES = {"pending_payment", "queued", "running", "docked", "proven", "settled", "failed"}
+VALID_STATES = {
+    "pending_payment", "queued", "running", "docked",
+    "verifying",   # primary job done, awaiting an independent re-run before settlement
+    "proven",      # independent verification matched within tolerance
+    "settled", "disputed", "failed",
+}
 
 JOB_KEY = "job:{job_id}"
 ESCROW_KEY = "escrow:{job_id}"
@@ -130,6 +135,30 @@ def confirm_job(job_id: str) -> dict | None:
     return record
 
 
+def create_verification_job(parent_job_id: str, spec: dict, exclude_worker: str | None) -> str:
+    """Create a derived re-execution job that an *independent* worker runs to check the
+    primary result. It's queued immediately (no pricing, no escrow, no researcher -- it's
+    internal), carries `kind=verification` so worker_callback routes it to the comparison
+    path instead of the settlement path, and records `exclude_worker` so claim_next_job
+    won't hand it back to the worker that produced the original result."""
+    job_id = str(uuid.uuid4())
+    record = {
+        "job_id": job_id,
+        "spec": spec,
+        "state": "queued",
+        "reason": "",
+        "result": None,
+        "claimed_by": None,
+        "kind": "verification",
+        "parent_job_id": parent_job_id,
+        "exclude_worker": exclude_worker,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _cmd("SET", JOB_KEY.format(job_id=job_id), json.dumps(record))
+    _cmd("RPUSH", QUEUE_KEY, job_id)
+    return job_id
+
+
 def get_job(job_id: str) -> dict | None:
     raw = _cmd("GET", JOB_KEY.format(job_id=job_id))
     if raw is None:
@@ -146,13 +175,31 @@ def claim_next_job(worker_id: str) -> dict | None:
 
     LPOP on a shared remote list is atomic, so two daemons racing to claim can't
     both get the same job_id -- no separate locking needed.
+
+    Verification jobs carry `exclude_worker` (the worker that produced the original
+    result): this worker must not verify its own work, so such a job is set aside and
+    the next one tried. Set-aside jobs are pushed back after, preserving order, so they
+    stay claimable by some *other* worker. If nothing claimable remains for this worker,
+    returns None (the excluded job just waits for an independent worker to poll).
     """
-    job_id = _cmd("LPOP", QUEUE_KEY)
-    if job_id is None:
-        return None
-    record = get_job(job_id)
+    set_aside = []
+    record = None
+    while True:
+        job_id = _cmd("LPOP", QUEUE_KEY)
+        if job_id is None:
+            break
+        candidate = get_job(job_id)
+        if candidate is None:
+            continue  # shouldn't happen, but don't crash the daemon over it
+        if candidate.get("kind") == "verification" and candidate.get("exclude_worker") == worker_id:
+            set_aside.append(job_id)
+            continue
+        record = candidate
+        break
+    for jid in set_aside:  # put skipped (excluded) jobs back for other workers
+        _cmd("RPUSH", QUEUE_KEY, jid)
     if record is None:
-        return None  # shouldn't happen, but don't crash the daemon over it
+        return None
     record["state"] = "running"
     record["claimed_by"] = worker_id
     record["started_at"] = datetime.now(timezone.utc).isoformat()
@@ -226,6 +273,16 @@ def update_job(job_id: str, *, state: str | None = None, reason: str | None = No
         record["reason"] = reason
     if result is not None:
         record["result"] = result
+    _put_job(record)
+
+
+def update_job_extra(job_id: str, **fields) -> None:
+    """Attach/overwrite arbitrary top-level fields on a job record (e.g. `walrus`,
+    `verification`) without disturbing the core state machine fields."""
+    record = get_job(job_id)
+    if record is None:
+        return
+    record.update(fields)
     _put_job(record)
 
 

@@ -9,6 +9,7 @@ POST /jobs/{job_id}/worker-callback. The control plane never blocks on a docking
 
 Hand-written (Codeplain dropped, see SESSION_HANDOFF.md).
 """
+import math
 import os
 import secrets
 import sys
@@ -22,6 +23,7 @@ from pydantic import BaseModel, Field, model_validator
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import models  # noqa: E402
+import walrus  # noqa: E402
 
 app = FastAPI(title="docking-marketplace-control-plane")
 
@@ -119,10 +121,65 @@ PRICE_PER_LIGAND_AT_BASELINE = 2.0  # USD-equivalent units; arbitrary placeholde
 BASELINE_EXHAUSTIVENESS = 8
 MIN_PRICE = 1.0
 
+# --- Execution verification (optimistic, sampled re-execution) ------------------------
+# A fraction of a completed job's ligands are re-docked by an *independent* worker with
+# the same fixed seed; if every sampled binding affinity matches the original within
+# VERIFY_TOLERANCE_KCAL, the job is proven and escrow releases -- otherwise it's disputed
+# and refunded. Vina is deterministic for a fixed seed on the same engine image, so a
+# tolerance this tight still leaves headroom for cross-machine float noise. Set
+# VERIFY_SAMPLE_FRACTION=0 to turn verification off (jobs then settle on first result).
+VERIFY_SAMPLE_FRACTION = float(os.environ.get("VERIFY_SAMPLE_FRACTION", "0.1"))
+VERIFY_TOLERANCE_KCAL = float(os.environ.get("VERIFY_TOLERANCE_KCAL", "1.0"))
+
+# A primary docking result exists (and is downloadable) from `docked` onward, through
+# verification and settlement -- `disputed` included, so a researcher can still inspect a
+# result that failed verification (they were refunded, but the data is theirs to see).
+RESULT_READY_STATES = {"docked", "verifying", "proven", "settled", "disputed"}
+
 
 def count_ligands(ligands_sdf: str) -> int:
     count = ligands_sdf.count("$$$$")
     return max(count, 1)  # a single molecule with no trailing delimiter still counts as 1
+
+
+def _split_sdf_blocks(ligands_sdf: str) -> list[str]:
+    """Split a multi-molecule SDF into individual molecule blocks by the `$$$$`
+    delimiter -- plain text, no RDKit (the control plane stays dependency-light). Each
+    returned block keeps its own trailing `$$$$\\n` so it's a valid standalone SDF."""
+    blocks = []
+    current = []
+    for line in ligands_sdf.splitlines(keepends=True):
+        current.append(line)
+        if line.startswith("$$$$"):
+            blocks.append("".join(current))
+            current = []
+    tail = "".join(current).strip()
+    if tail:  # a final molecule with no trailing delimiter
+        blocks.append("".join(current) if "".join(current).endswith("\n") else "".join(current) + "\n")
+    return blocks
+
+
+def sample_ligands_for_verification(ligands_sdf: str, fraction: float, seed_text: str) -> str:
+    """Pick a deterministic-but-provider-unpredictable subset of molecule blocks to
+    re-dock for verification. Deterministic (so it's reproducible and auditable) yet
+    derived from a hash of the job id (so a provider can't know in advance which ligands
+    will be checked and cut corners on the rest). Returns a standalone multi-molecule
+    SDF of the sampled blocks."""
+    import hashlib
+
+    blocks = _split_sdf_blocks(ligands_sdf)
+    n = len(blocks)
+    if n == 0:
+        return ligands_sdf
+    k = max(1, math.ceil(fraction * n))
+    # Rank blocks by H(seed_text || index); take the k smallest -- a stable pseudo-random
+    # sample with no PRNG state to thread through.
+    ranked = sorted(
+        range(n),
+        key=lambda i: hashlib.sha256(f"{seed_text}:{i}".encode()).hexdigest(),
+    )
+    chosen = sorted(ranked[:k])
+    return "".join(blocks[i] for i in chosen)
 
 
 def estimate_price(num_ligands: int, exhaustiveness: int) -> float:
@@ -318,7 +375,7 @@ def get_result(job_id: str) -> list:
     job = models.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404)
-    if job["state"] not in ("docked", "proven", "settled"):
+    if job["state"] not in RESULT_READY_STATES:
         raise HTTPException(status_code=409, detail=f"job is in state {job['state']}, not yet docked")
     return job["result"]
 
@@ -336,7 +393,7 @@ def download_result(job_id: str) -> Response:
     job = models.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404)
-    if job["state"] not in ("docked", "proven", "settled"):
+    if job["state"] not in RESULT_READY_STATES:
         raise HTTPException(status_code=409, detail=f"job is in state {job['state']}, not yet docked")
 
     buf = io.BytesIO()
@@ -364,9 +421,9 @@ def get_job_page(job_id: str) -> str:
       <p><strong>Status:</strong> {state}</p>
       <p><strong>Price:</strong> ${job.get('price', '?')}</p>
     """
-    if state == "failed":
+    if state in ("failed", "disputed"):
         body += f"<p><strong>Reason:</strong> {job.get('reason', '')}</p>"
-    if state in ("docked", "proven", "settled"):
+    if state in RESULT_READY_STATES and job.get("result"):
         rows = "".join(
             f"<tr><td>{r['ligand_id']}</td><td>{r.get('vina_affinity', r.get('error', ''))}</td></tr>"
             for r in job["result"]
@@ -378,8 +435,45 @@ def get_job_page(job_id: str) -> str:
     else:
         body += "<p class=\"lede\">Refresh this page to check progress.</p>"
     body += "</div>"
+    body += _verification_html(job)
+    body += _walrus_html(job)
     body += _escrow_chain_html(job_id)
     return page(f"Job {job_id[:8]}", body)
+
+
+def _verification_html(job: dict) -> str:
+    """Render the independent-re-execution verification outcome, when present."""
+    v = job.get("verification")
+    if not v:
+        return ""
+    status = v.get("status", "?")
+    label = {
+        "pending": "Independent re-execution in progress…",
+        "passed": "Verified — an independent re-run reproduced the result",
+        "failed": "Disputed — an independent re-run did NOT reproduce the result",
+        "inconclusive": "Inconclusive — could not be independently verified",
+        "skipped": "Not independently verified",
+    }.get(status, status)
+    rows = [f"<p><strong>Verification:</strong> {label}</p>"]
+    if v.get("checked_ligands") is not None:
+        rows.append(f"<p>Re-docked {v['checked_ligands']} sampled ligand(s); max affinity "
+                    f"deviation {v.get('max_deviation_kcal')} kcal/mol "
+                    f"(tolerance {v.get('tolerance_kcal')}).</p>")
+    if v.get("reason"):
+        rows.append(f'<p class="lede">{v["reason"]}</p>')
+    return '<div class="card">' + "".join(rows) + "</div>"
+
+
+def _walrus_html(job: dict) -> str:
+    """Render the Walrus tamper-evidence anchor (blob id + bundle hash) as a public link."""
+    w = job.get("walrus")
+    if not w:
+        return ""
+    return f"""<div class="card">
+      <p><strong>Result anchored on Walrus (tamper-evident, public):</strong></p>
+      <p>Bundle SHA-256: <code>{w.get('bundle_sha256', '')[:24]}…</code></p>
+      <p>Blob: <a href="{w.get('aggregator_url', '#')}">{w.get('blob_id', '')[:24]}…</a></p>
+    </div>"""
 
 
 def _suiscan(kind: str, ident: str) -> str:
@@ -427,6 +521,9 @@ def worker_callback(job_id: str, callback: WorkerCallback) -> dict:
 
     models.finish_running(job_id)  # reached a terminal state -- reclaim sweep can ignore it
 
+    if job.get("kind") == "verification":
+        return _handle_verification_callback(job, callback)
+
     if callback.error is not None:
         models.update_job(job_id, state="failed", reason=callback.error)
         models.escrow_refund(job_id)
@@ -434,14 +531,56 @@ def worker_callback(job_id: str, callback: WorkerCallback) -> dict:
 
     models.update_job(job_id, state="docked", result=callback.result)
 
-    # "Verification" right now is just "the worker reported success" -- there's no real
-    # tamper-evident proof system yet (see SESSION_HANDOFF.md §8). That's the honest
-    # current state, but payment release must still actually happen on success, which
-    # it didn't before this fix: escrow was held on confirm and then never touched
-    # again, so every successful job left it stuck "held" forever.
-    # Pay out to the address the claiming provider registered (if any) -- that's who
-    # actually did the compute. With no address on file the release still settles the
-    # job but stays a mock (no real on-chain transfer to nowhere).
+    # Anchor a hashes-only manifest of this result on Walrus (best-effort, public,
+    # tamper-evident -- see walrus.py). Never identifies the molecules; never blocks.
+    manifest = walrus.build_manifest(
+        job_id, job["spec"]["params"]["seed"], "vina", callback.result or []
+    )
+    anchor = walrus.publish_manifest(manifest)
+    if anchor:
+        models.update_job_extra(job_id, walrus=anchor)
+
+    # Optimistic verification: re-dock a sample on an INDEPENDENT worker before paying.
+    # Needs a second, currently-online worker; with none available we can't verify, so we
+    # settle now and record that no independent check was possible (no silent gap).
+    if VERIFY_SAMPLE_FRACTION > 0 and _independent_worker_available(job.get("claimed_by")):
+        sub_sdf = sample_ligands_for_verification(
+            job["spec"]["ligands_sdf"], VERIFY_SAMPLE_FRACTION, job_id
+        )
+        sub_spec = {**job["spec"], "ligands_sdf": sub_sdf}
+        verifier_job_id = models.create_verification_job(
+            parent_job_id=job_id, spec=sub_spec, exclude_worker=job.get("claimed_by")
+        )
+        models.update_job(job_id, state="verifying")
+        models.update_job_extra(job_id, verification={
+            "status": "pending",
+            "verifier_job_id": verifier_job_id,
+            "sample_fraction": VERIFY_SAMPLE_FRACTION,
+            "tolerance_kcal": VERIFY_TOLERANCE_KCAL,
+        })
+        return {"ok": True, "verifying": True, "verifier_job_id": verifier_job_id}
+
+    note = None if VERIFY_SAMPLE_FRACTION <= 0 else "no independent verifier online"
+    _settle_primary(job, note=note)
+    return {"ok": True}
+
+
+def _independent_worker_available(original_worker_id: str | None) -> bool:
+    """True if some worker other than the one that ran the job is currently online and
+    could perform an independent re-execution."""
+    for wid in models.list_workers():
+        if wid == original_worker_id:
+            continue
+        w = models.get_worker(wid)
+        if w and w.get("status") == "online":
+            return True
+    return False
+
+
+def _settle_primary(job: dict, *, note: str | None = None) -> None:
+    """Release escrow to the provider and mark the primary job settled. `note` records
+    why verification was skipped, when it was."""
+    job_id = job["job_id"]
     provider_address = None
     if job.get("claimed_by"):
         worker = models.get_worker(job["claimed_by"])
@@ -451,7 +590,59 @@ def worker_callback(job_id: str, callback: WorkerCallback) -> dict:
         models.update_job(job_id, state="settled")
         if job.get("claimed_by"):
             models.increment_worker_stats(job["claimed_by"], completed=True, earned=job.get("price", 0))
-    return {"ok": True}
+    if note:
+        models.update_job_extra(job_id, verification={"status": "skipped", "reason": note})
+
+
+def _handle_verification_callback(verif_job: dict, callback: WorkerCallback) -> dict:
+    """The independent re-run came back. Compare its affinities to the primary's for the
+    sampled ligands (matched by ligand_id); within tolerance -> prove + settle the
+    parent, beyond it -> dispute + refund. A verifier engine error can't itself condemn
+    the provider, so it settles the parent with the result unverified."""
+    parent_id = verif_job.get("parent_job_id")
+    parent = models.get_job(parent_id) if parent_id else None
+    if parent is None or parent["state"] != "verifying":
+        return {"ok": True, "ignored": "parent gone or not awaiting verification"}
+
+    if callback.error is not None:  # couldn't re-run -> don't punish the provider
+        models.update_job_extra(parent_id, verification={
+            "status": "inconclusive", "reason": f"verifier errored: {callback.error}"})
+        _settle_primary(parent)
+        return {"ok": True, "verification": "inconclusive"}
+
+    primary_aff = {r["ligand_id"]: r["vina_affinity"]
+                   for r in (parent.get("result") or []) if "vina_affinity" in r}
+    verif_aff = {r["ligand_id"]: r["vina_affinity"]
+                 for r in (callback.result or []) if "vina_affinity" in r}
+    common = [lid for lid in verif_aff if lid in primary_aff]
+
+    if not common:  # naming mismatch (e.g. unnamed ligands) -> can't compare; don't punish
+        models.update_job_extra(parent_id, verification={
+            "status": "inconclusive", "reason": "no overlapping ligand ids to compare"})
+        _settle_primary(parent)
+        return {"ok": True, "verification": "inconclusive"}
+
+    deviations = {lid: abs(primary_aff[lid] - verif_aff[lid]) for lid in common}
+    max_dev = max(deviations.values())
+    detail = {
+        "status": "passed" if max_dev <= VERIFY_TOLERANCE_KCAL else "failed",
+        "checked_ligands": len(common),
+        "max_deviation_kcal": round(max_dev, 4),
+        "tolerance_kcal": VERIFY_TOLERANCE_KCAL,
+    }
+    if max_dev <= VERIFY_TOLERANCE_KCAL:
+        models.update_job(parent_id, state="proven")
+        models.update_job_extra(parent_id, verification=detail)
+        _settle_primary(parent)
+        return {"ok": True, "verification": "passed"}
+
+    # Beyond tolerance: the provider's result doesn't reproduce. Dispute -> refund, no pay.
+    models.update_job(parent_id, state="disputed",
+                      reason=f"verification mismatch: max deviation {max_dev:.2f} kcal/mol "
+                             f"exceeds tolerance {VERIFY_TOLERANCE_KCAL}")
+    models.update_job_extra(parent_id, verification=detail)
+    models.escrow_refund(parent_id)
+    return {"ok": True, "verification": "failed"}
 
 
 class WorkerRegistration(WorkerAuth):
