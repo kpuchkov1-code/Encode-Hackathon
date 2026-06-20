@@ -11,6 +11,7 @@ Hand-written (Codeplain dropped, see SESSION_HANDOFF.md).
 """
 import os
 import sys
+import uuid
 from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -167,28 +168,40 @@ def register_worker(registration: WorkerRegistration) -> dict:
 
 @app.get("/providers/signup", response_class=HTMLResponse)
 def providers_signup_form() -> str:
-    return """
+    suggested_id = f"worker-{uuid.uuid4().hex[:8]}"
+    return f"""
     <h1>Provide idle compute</h1>
+    <p>Hardware is detected automatically by the daemon when it starts (CPU cores,
+    GPU if present) -- you don't need to describe it yourself.</p>
     <form method="post" action="/providers/signup">
-      <label>Worker ID (pick something unique): <input name="worker_id" required></label><br>
-      <label>Hardware description (e.g. "RTX 3070, 8 cores"): <input name="hardware_info"></label><br>
-      <button type="submit">Register</button>
+      <label>Worker ID: <input name="worker_id" value="{suggested_id}" required></label><br>
+      <button type="submit">Sign up</button>
     </form>
     """
 
 
 @app.post("/providers/signup", response_class=HTMLResponse)
-def providers_signup_submit(request: Request, worker_id: str = Form(...), hardware_info: str = Form("")) -> str:
-    models.register_worker(worker_id, hardware_info)
+def providers_signup_submit(request: Request, worker_id: str = Form(...)) -> str:
+    models.register_worker(worker_id, "(pending -- starts once the daemon runs and detects it)")
     base_url = str(request.base_url).rstrip("/")
     return f"""
-    <h1>Registered: {worker_id}</h1>
-    <p>Run this on the machine providing compute (needs Python 3 + Docker):</p>
-    <pre>CONTROL_PLANE_URL={base_url} WORKER_ID={worker_id} python worker_daemon.py</pre>
-    <p>The daemon will poll for jobs, run them in a Docker container, and report back.
-    Nothing else is installed on your machine -- gnina/RDKit/etc. are sealed inside the
-    per-job container.</p>
+    <h1>Signed up: {worker_id}</h1>
+    <p>Step 2 -- run this on the machine providing compute (needs Python 3 + Docker;
+    nothing else is installed on your machine, the docking engine is sealed inside a
+    per-job container):</p>
+    <pre>CONTROL_PLANE_URL={base_url} WORKER_ID={worker_id} ./install_worker.sh</pre>
+    <p>On startup the daemon detects your hardware (CPU cores, GPU if present) and
+    reports it back automatically -- check <a href="{base_url}/workers/{worker_id}">{base_url}/workers/{worker_id}</a>
+    after starting it to confirm.</p>
     """
+
+
+@app.get("/workers/{worker_id}")
+def get_worker(worker_id: str) -> dict:
+    worker = models.get_worker(worker_id)
+    if worker is None:
+        raise HTTPException(status_code=404)
+    return worker
 
 
 @app.get("/researchers/submit", response_class=HTMLResponse)

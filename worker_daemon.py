@@ -18,6 +18,7 @@ Usage:
 import json
 import logging
 import os
+import platform
 import shutil
 import socket
 import subprocess
@@ -51,6 +52,38 @@ def has_gpu_passthrough_available() -> bool:
         return False
     info = subprocess.run(["docker", "info"], capture_output=True, text=True)
     return "nvidia" in info.stdout.lower()
+
+
+def detect_hardware(gpu_available: bool) -> str:
+    """Real detection, not a free-text field someone types in: CPU core count and
+    platform always; GPU model name too if a real GPU + driver is present (regardless
+    of whether the container toolkit is set up for passthrough yet)."""
+    parts = [f"{os.cpu_count()} CPU cores", platform.system(), platform.machine()]
+    gpu_name = None
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            gpu_name = out.stdout.strip().splitlines()[0]
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        pass
+    if gpu_name:
+        parts.append(f"GPU: {gpu_name}" + (" (passthrough ready)" if gpu_available else " (no passthrough yet)"))
+    return ", ".join(parts)
+
+
+def register_self(hardware_info: str) -> None:
+    try:
+        requests.post(
+            f"{CONTROL_PLANE_URL}/workers/register",
+            json={"worker_id": WORKER_ID, "hardware_info": hardware_info},
+            timeout=10,
+        ).raise_for_status()
+        log.info("registered with control plane: %s", hardware_info)
+    except requests.RequestException:
+        log.exception("could not register with control plane (continuing anyway)")
 
 
 def ensure_engine_image_built() -> None:
@@ -115,6 +148,8 @@ def main() -> None:
 
     gpu_available = has_gpu_passthrough_available()
     log.info("GPU passthrough available: %s", gpu_available)
+
+    register_self(detect_hardware(gpu_available))
 
     ensure_engine_image_built()
     log.info("engine image ready, polling for jobs...")
