@@ -9,20 +9,37 @@ POST /jobs/{job_id}/worker-callback. The control plane never blocks on a docking
 
 Hand-written (Codeplain dropped, see SESSION_HANDOFF.md).
 """
+import io
 import os
 import sys
 import uuid
+import zipfile
 from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field, model_validator
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO_ROOT)
 import models  # noqa: E402
 
 app = FastAPI(title="docking-marketplace-control-plane")
+
+# Files that make up the worker package -- everything a hardware provider needs to run
+# the daemon, and *only* that. Never the control plane's own source (api/, models.py),
+# and never anything that would require git/GitHub access to this private repo.
+WORKER_PACKAGE_FILES = [
+    "install_worker.sh",
+    "worker_daemon.py",
+    "docking_worker.py",
+    "docking_worker_vina.py",
+    "worker_setup.py",
+    "engine_entrypoint_vina.py",
+    "requirements-worker.txt",
+    "vina-test/Dockerfile",
+]
 
 
 @app.exception_handler(RequestValidationError)
@@ -180,10 +197,6 @@ def providers_signup_form() -> str:
     """
 
 
-GITHUB_REPO_URL = "https://github.com/kpuchkov1-code/Encode-Hackathon"
-GITHUB_BRANCH = "backend/handwritten-vercel-worker-split"  # TODO: update once merged to main
-
-
 @app.post("/providers/signup", response_class=HTMLResponse)
 def providers_signup_submit(request: Request, worker_id: str = Form(...)) -> str:
     models.register_worker(worker_id, "(pending -- starts once the daemon runs and detects it)")
@@ -192,7 +205,8 @@ def providers_signup_submit(request: Request, worker_id: str = Form(...)) -> str
     return f"""
     <h1>Signed up: {worker_id}</h1>
     <p>Follow these steps on the computer that will actually provide compute (it can be
-    a different machine than the one you're signing up from):</p>
+    a different machine than the one you're signing up from). You do not need a GitHub
+    account or any access to our source code -- just this one setup package.</p>
     <ol>
       <li>Install Docker if you don't already have it:
         <a href="https://docs.docker.com/get-docker/">https://docs.docker.com/get-docker/</a>.
@@ -200,10 +214,10 @@ def providers_signup_submit(request: Request, worker_id: str = Form(...)) -> str
       </li>
       <li>Make sure Python 3 is installed (<code>python3 --version</code> in a terminal;
         most Mac/Linux machines already have it -- on Windows, use WSL).</li>
-      <li>Open a terminal and download the code:
-        <pre>git clone {GITHUB_REPO_URL}.git
-cd Encode-Hackathon
-git checkout {GITHUB_BRANCH}
+      <li>Download and unpack the worker setup package:
+        <pre>curl -L {base_url}/download/worker-package.zip -o worker-package.zip
+unzip worker-package.zip -d worker-package
+cd worker-package
 chmod +x install_worker.sh</pre>
       </li>
       <li>Run this exact command (already has your worker ID and this server's address
@@ -225,6 +239,21 @@ chmod +x install_worker.sh</pre>
         may be assigned to run it automatically.</li>
     </ol>
     """
+
+
+@app.get("/download/worker-package.zip")
+def download_worker_package() -> Response:
+    """Everything a hardware provider needs to run the daemon, packaged on demand from
+    this server's own deployed files -- never git/GitHub access to the backend repo."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for rel_path in WORKER_PACKAGE_FILES:
+            zf.write(os.path.join(REPO_ROOT, rel_path), arcname=rel_path)
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": "attachment; filename=worker-package.zip"},
+    )
 
 
 @app.get("/workers/{worker_id}")

@@ -1,9 +1,10 @@
-# Only the control plane (api/, models.py, requirements.txt) is deployed to Vercel.
-# Everything else here is worker-side (runs on provider hardware, never on Vercel) or
-# dev tooling -- see SESSION_HANDOFF.md for the control-plane/worker split.
+# The control plane (api/, models.py, requirements.txt) is what actually runs on
+# Vercel. The worker-side files below are NOT executed here -- they're bundled only so
+# GET /download/worker-package.zip can serve them to hardware providers without ever
+# giving them git/GitHub access to this repo. See SESSION_HANDOFF.md for the
+# control-plane/worker split.
 .venv/
 gnina-bin/
-vina-test/
 fixtures/
 docs/
 scripts/
@@ -19,15 +20,10 @@ escrow_ledger.json
 config.yaml
 run_unittests_python.sh
 run_conformance_tests_python.sh
-requirements-worker.txt
 requirements-wsl.txt
+# gnina's engine image/entrypoint aren't offered for download yet (not built/working) --
+# exclude them so the download package only contains what actually works (Vina).
 Dockerfile
-docking_worker.py
-docking_worker_vina.py
-worker_setup.py
-worker_daemon.py
 engine_entrypoint.py
-engine_entrypoint_vina.py
-install_worker.sh
 SESSION_HANDOFF.md
 README.md
