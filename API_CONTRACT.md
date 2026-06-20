@@ -37,6 +37,18 @@ Payment hold (DeepBook stand-in).
 - `200` → `{ "state": "held" | "released" | "refunded", "amount": <number>, "supplier_id": "..." }`
 - `404`
 
+### 🔜 `POST /jobs/<job_id>/run` (supply side — a provider claims + starts a queued job)
+The seller dashboard's "Run" action. Claims a `queued` job for a provider and starts
+docking. This is the backend handoff §8 option (a) — building it server-side makes the
+supply side genuinely causal with **zero UI changes** (the mock implements it now).
+- Body: `{ "supplier_id": "node-1" }`
+- `202` → `{ "job_id": "...", "state": "running", "worker_id": "node-1" }`
+- `409` → `{ "error": "job not claimable (state=...)" }` (not `queued` / already taken)
+- `404` → `{ "error": "job not found" }`
+
+On success the backend SHOULD set the job's `worker_id` and attribute escrow to
+`supplier_id`, so the provider's earnings (via `GET /jobs/<id>/escrow`) reflect the claim.
+
 ### 🔜 `GET /jobs` (list — needed for dashboards)
 - `200` → `{ "jobs": [ { "job_id": "...", "state": "...", "created_at": "<iso>" } ] }`
 
@@ -117,6 +129,11 @@ Sorted by `cnn_affinity` descending (best binder first). Higher `cnn_affinity` =
 ## Test hooks (mock only)
 - Submitting a job with `receptor.pdb_id === "FAIL"` drives the job to `failed` (and
   escrow `refunded`) so the frontend can build/exercise the error + refund UI.
+- `MOCK_AUTORUN_MS` (default `1500`) controls how long a submitted job sits `queued`
+  before the mock auto-advances it. Set `MOCK_AUTORUN_MS=0` to disable auto-advance so jobs
+  wait for a real `POST /jobs/<id>/run` — the **two-sided demo** mode where the seller's
+  Run button is causal. The real backend has no such knob; it advances on `run` (or its
+  own dispatch).
 
 ## Notes for both sides
 - Docking is **async**: `POST /jobs` returns immediately as `queued`; the frontend polls.

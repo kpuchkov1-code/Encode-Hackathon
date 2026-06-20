@@ -83,6 +83,13 @@ export interface JobStatus {
   reason: string; // empty unless failed
 }
 
+/** Response of POST /jobs/<id>/run — a provider claimed + started the job. */
+export interface RunJobResponse {
+  job_id: string;
+  state: JobState;
+  worker_id: string;
+}
+
 export type EscrowState = "held" | "released" | "refunded";
 export interface Escrow {
   state: EscrowState;

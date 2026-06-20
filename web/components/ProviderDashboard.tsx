@@ -2,9 +2,20 @@
 
 import { useMemo, useState } from "react";
 import Link from "next/link";
+import { useSWRConfig } from "swr";
 import { useEscrows, useJobsList } from "@/lib/hooks";
-import type { JobListItem } from "@/lib/types";
+import { ApiError, runJob } from "@/lib/api";
+import {
+  cumulative,
+  deriveReliability,
+  deriveStats,
+  deriveUtilization,
+  earningsBreakdown,
+} from "@/lib/provider";
+import type { EscrowState, JobListItem, JobState } from "@/lib/types";
 import { SponsorBadge } from "./SponsorBadge";
+import { JobProgress } from "./JobProgress";
+import { EarningsBreakdown } from "./EarningsBreakdown";
 
 // Mocked node identity. Uses node-1 so it owns the sample jobs' escrow → earnings show.
 const NODE = {
@@ -14,31 +25,47 @@ const NODE = {
   cuda: "CUDA 12.4",
   region: "eu-west-1",
   dlperf: "21.3", // vast.ai-style deep-learning perf score (simulated)
-  reliability: 99.4, // simulated telemetry
-  utilization: 73, // simulated occupancy
-  uptime: "99.9%",
+  uptime: "99.9%", // simulated
+  capacity: 4, // concurrent jobs this node will take — drives utilization
 };
+
+type EscrowMap = Record<
+  string,
+  { amount: number; state: EscrowState; supplier_id: string }
+>;
 
 export function ProviderDashboard() {
   const { jobs, loading } = useJobsList();
   const escrows = useEscrows(jobs.map((j) => j.job_id));
-  const [online, setOnline] = useState(false);
-  const [claimed, setClaimed] = useState<Set<string>>(new Set());
-  const [rate, setRate] = useState(100);
+  const { mutate } = useSWRConfig();
 
-  const { earned, pending, completed } = useMemo(() => {
-    let earned = 0;
-    let pending = 0;
-    let completed = 0;
-    for (const j of jobs) {
-      const e = escrows[j.job_id];
-      if (!e || e.supplier_id !== NODE.id) continue;
-      if (e.state === "released") {
-        earned += e.amount;
-        completed += 1;
-      } else if (e.state === "held") pending += e.amount;
-    }
-    return { earned, pending, completed };
+  const [online, setOnline] = useState(false);
+  const [rate, setRate] = useState(100);
+  // Jobs this provider has claimed this session.
+  const [claimed, setClaimed] = useState<Set<string>>(new Set());
+  // Immediate state overlay so a claimed job shows "running" before polling catches up.
+  const [optimistic, setOptimistic] = useState<Record<string, JobState>>({});
+  // Run requests currently in flight (disable the button, show "starting…").
+  const [busy, setBusy] = useState<Set<string>>(new Set());
+  // Per-job run errors (409 already-taken / 404 / network).
+  const [errors, setErrors] = useState<Record<string, string>>({});
+
+  const stats = useMemo(
+    () => deriveStats(jobs, escrows, NODE.id),
+    [jobs, escrows],
+  );
+  const reliability = deriveReliability(stats.completed, stats.refunded);
+  const utilization = online ? deriveUtilization(stats.inFlight, NODE.capacity) : 0;
+  const breakdown = earningsBreakdown(stats.earned);
+
+  // Cumulative earnings series (chronological) for the sparkline.
+  const series = useMemo(() => {
+    const settled = [...jobs]
+      .sort((a, b) => (a.created_at ?? "").localeCompare(b.created_at ?? ""))
+      .map((j) => escrows[j.job_id])
+      .filter((e) => e && e.supplier_id === NODE.id && e.state === "released")
+      .map((e) => e!.amount);
+    return cumulative(settled);
   }, [jobs, escrows]);
 
   const market = useMemo(() => {
@@ -55,7 +82,44 @@ export function ProviderDashboard() {
     return { queued, active, avg, demand };
   }, [jobs, escrows]);
 
-  const claim = (id: string) => setClaimed((prev) => new Set(prev).add(id));
+  const isYours = (id: string) =>
+    claimed.has(id) || escrows[id]?.supplier_id === NODE.id;
+
+  const displayState = (j: JobListItem): JobState =>
+    optimistic[j.job_id] && j.state === "queued" ? optimistic[j.job_id] : j.state;
+
+  async function onRun(id: string) {
+    setErrors((e) => {
+      const next = { ...e };
+      delete next[id];
+      return next;
+    });
+    setBusy((b) => new Set(b).add(id));
+    try {
+      const res = await runJob(id, NODE.id);
+      setClaimed((c) => new Set(c).add(id));
+      setOptimistic((o) => ({ ...o, [id]: res.state }));
+      // Pull the job list (and let escrow polling re-attribute) ASAP.
+      mutate("/api/jobs");
+    } catch (err) {
+      const msg =
+        err instanceof ApiError
+          ? err.status === 409
+            ? "already taken"
+            : err.status === 404
+              ? "no longer available"
+              : err.message
+          : "couldn’t start job";
+      setErrors((e) => ({ ...e, [id]: msg }));
+    } finally {
+      setBusy((b) => {
+        const next = new Set(b);
+        next.delete(id);
+        return next;
+      });
+    }
+  }
+
   const sorted = [...jobs].sort((a, b) =>
     (b.created_at ?? "").localeCompare(a.created_at ?? ""),
   );
@@ -74,14 +138,23 @@ export function ProviderDashboard() {
 
       {/* Top metric row — vast.ai-style */}
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <Metric label="Earnings" value={earned.toLocaleString()} unit="credits" accent />
-        <Metric label="Utilization" value={`${online ? NODE.utilization : 0}%`}>
-          <Bar pct={online ? NODE.utilization : 0} />
+        <Metric label="Net earnings" value={breakdown.net.toLocaleString()} unit="credits" accent />
+        <Metric label="Utilization" value={`${utilization}%`}>
+          <Bar pct={utilization} />
         </Metric>
-        <Metric label="Reliability" value={`${online ? NODE.reliability : 0}%`}>
-          <Bar pct={online ? NODE.reliability : 0} good />
+        <Metric label="Reliability" value={reliability === null ? "—" : `${reliability}%`}>
+          <Bar pct={reliability ?? 0} good />
         </Metric>
-        <Metric label="Jobs completed" value={`${completed}`} unit={`${pending} pending`} />
+        <Metric label="Jobs completed" value={`${stats.completed}`} unit={`${stats.pending.toLocaleString()} pending`} />
+      </div>
+
+      <div className="mt-5">
+        <EarningsBreakdown
+          gross={breakdown.gross}
+          fee={breakdown.fee}
+          net={breakdown.net}
+          series={series}
+        />
       </div>
 
       <div className="mt-5 grid gap-5 lg:grid-cols-[1fr_1fr]">
@@ -98,16 +171,21 @@ export function ProviderDashboard() {
       <JobFeed
         jobs={sorted}
         escrows={escrows}
-        claimed={claimed}
         online={online}
         loading={loading}
-        onClaim={claim}
+        busy={busy}
+        errors={errors}
+        isYours={isYours}
+        displayState={displayState}
+        onRun={onRun}
       />
 
       <p className="mt-4 text-[11px] text-muted">
-        Node specs, telemetry (utilization / reliability / DLPerf) and the “Run” action are
-        simulated for the demo. Earnings, the job feed and market demand are derived from real{" "}
-        <SponsorBadge name="DeepBook" /> escrow + job data.
+        GPU model, DLPerf and uptime are simulated for the demo. Earnings, reliability,
+        utilization, the job feed and market demand are derived from real{" "}
+        <SponsorBadge name="DeepBook" /> escrow + job data. The “Run” action calls the real{" "}
+        <code className="font-mono">POST /jobs/&lt;id&gt;/run</code> endpoint (mocked today,
+        same shape the backend will ship).
       </p>
     </main>
   );
@@ -286,17 +364,23 @@ function MiniStat({ label, value }: { label: string; value: string }) {
 function JobFeed({
   jobs,
   escrows,
-  claimed,
   online,
   loading,
-  onClaim,
+  busy,
+  errors,
+  isYours,
+  displayState,
+  onRun,
 }: {
   jobs: JobListItem[];
-  escrows: Record<string, { amount: number; state: string; supplier_id: string }>;
-  claimed: Set<string>;
+  escrows: EscrowMap;
   online: boolean;
   loading: boolean;
-  onClaim: (id: string) => void;
+  busy: Set<string>;
+  errors: Record<string, string>;
+  isYours: (id: string) => boolean;
+  displayState: (j: JobListItem) => JobState;
+  onRun: (id: string) => void;
 }) {
   return (
     <div className="mt-5 rounded-xl border border-border bg-surface p-5">
@@ -325,22 +409,47 @@ function JobFeed({
             <tbody className="font-mono">
               {jobs.map((j) => {
                 const e = escrows[j.job_id];
-                const isClaimed = claimed.has(j.job_id);
+                const yours = isYours(j.job_id);
+                const state = displayState(j);
+                const err = errors[j.job_id];
                 return (
                   <tr key={j.job_id} className="border-b border-border/50 last:border-0">
-                    <td className="py-2.5 pr-3 text-foreground/90">{j.job_id.slice(0, 8)}…</td>
-                    <td className="py-2.5 pr-3">
-                      <StateBadge state={j.state} claimedByYou={isClaimed} />
+                    <td className="py-2.5 pr-3 align-top text-foreground/90">
+                      <div className="flex items-center gap-2">
+                        {j.job_id.slice(0, 8)}…
+                        {yours && (
+                          <span className="rounded bg-accent/15 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-accent-bright">
+                            you
+                          </span>
+                        )}
+                      </div>
+                      {yours && state === "settled" && (
+                        <div className="mt-1 flex items-center gap-1.5 text-[10px] text-muted">
+                          released via <SponsorBadge name="DeepBook" /> · proof on{" "}
+                          <SponsorBadge name="Walrus" />
+                        </div>
+                      )}
+                      {err && (
+                        <div className="mt-1 text-[10px] text-red-300">{err}</div>
+                      )}
                     </td>
-                    <td className="py-2.5 pr-3 text-right text-foreground">
+                    <td className="py-2.5 pr-3 align-top">
+                      {yours ? (
+                        <JobProgress state={state} />
+                      ) : (
+                        <StateBadge state={state} />
+                      )}
+                    </td>
+                    <td className="py-2.5 pr-3 text-right align-top text-foreground">
                       {e ? `${e.amount.toLocaleString()}` : "—"}
                     </td>
-                    <td className="py-2.5 text-right">
+                    <td className="py-2.5 text-right align-top">
                       <Action
-                        state={j.state}
-                        claimed={isClaimed}
+                        state={state}
+                        yours={yours}
                         online={online}
-                        onClaim={() => onClaim(j.job_id)}
+                        busy={busy.has(j.job_id)}
+                        onRun={() => onRun(j.job_id)}
                       />
                     </td>
                   </tr>
@@ -354,7 +463,7 @@ function JobFeed({
   );
 }
 
-function StateBadge({ state, claimedByYou }: { state: string; claimedByYou: boolean }) {
+function StateBadge({ state }: { state: string }) {
   const map: Record<string, string> = {
     queued: "text-amber-300",
     running: "text-accent-bright",
@@ -363,43 +472,39 @@ function StateBadge({ state, claimedByYou }: { state: string; claimedByYou: bool
     settled: "text-green-300",
     failed: "text-red-300",
   };
-  return (
-    <span className={map[state] ?? "text-muted"}>
-      {state}
-      {claimedByYou && state !== "settled" && state !== "failed" && (
-        <span className="ml-2 rounded bg-accent/15 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-accent-bright">
-          you
-        </span>
-      )}
-    </span>
-  );
+  return <span className={map[state] ?? "text-muted"}>{state}</span>;
 }
 
 function Action({
   state,
-  claimed,
+  yours,
   online,
-  onClaim,
+  busy,
+  onRun,
 }: {
   state: string;
-  claimed: boolean;
+  yours: boolean;
   online: boolean;
-  onClaim: () => void;
+  busy: boolean;
+  onRun: () => void;
 }) {
   if (state === "settled") return <span className="text-green-300">+ paid</span>;
   if (state === "failed") return <span className="text-muted">refunded</span>;
-  if (state === "queued" && !claimed) {
+  if (state === "queued") {
     return (
       <button
         type="button"
-        onClick={onClaim}
-        disabled={!online}
-        title={online ? "Run this job" : "Connect your node first"}
+        onClick={onRun}
+        disabled={!online || busy}
+        title={online ? "Claim and run this job" : "Connect your node first"}
         className="rounded-md bg-accent px-3 py-1 text-xs font-medium text-white transition-colors hover:bg-accent-bright disabled:opacity-40"
       >
-        Run
+        {busy ? "starting…" : "Run"}
       </button>
     );
   }
-  return <span className="text-xs text-muted">running…</span>;
+  // running / docked / proven
+  return (
+    <span className="text-xs text-muted">{yours ? "you · running" : "running…"}</span>
+  );
 }

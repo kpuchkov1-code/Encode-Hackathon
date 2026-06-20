@@ -9,6 +9,7 @@ import type {
   JobsListResponse,
   JobStatus,
   Proof,
+  RunJobResponse,
 } from "./types";
 
 class ApiError extends Error {
@@ -59,5 +60,18 @@ export const getResult = (id: string): Promise<DockResult> =>
 
 export const getProof = (id: string): Promise<Proof> =>
   fetcher(`/api/jobs/${id}/proof`);
+
+/** Provider claims + starts a queued job (the seller "Run" action). */
+export async function runJob(
+  id: string,
+  supplierId: string,
+): Promise<RunJobResponse> {
+  const res = await fetch(`/api/jobs/${id}/run`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ supplier_id: supplierId }),
+  });
+  return json<RunJobResponse>(res);
+}
 
 export { ApiError };

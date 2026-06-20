@@ -216,6 +216,10 @@ error branch (carries `reason`). Build a **5-step stepper** plus an error state:
 Add these to the backend so the UI is fully functional:
 1. **`GET /jobs` list endpoint** — return all jobs (`job_id`, `state`, `created_at`) for
    dashboards/history. (Not built yet.)
+1b. **`POST /jobs/<id>/run` endpoint** — the seller dashboard's "Run" action (claims +
+   starts a `queued` job; see `API_CONTRACT.md`). This is §8 option (a). The frontend +
+   mock already implement/consume it; the real backend just needs to honor the same shape
+   and the UI works unchanged. Set `worker_id` + attribute escrow to the `supplier_id`.
 2. **CORS** — only required if you call the backend directly from the browser instead of
    via the Next proxy. If so, enable `flask-cors` for the frontend origin (add to the
    `.plain` implementation reqs).

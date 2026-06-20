@@ -6,16 +6,23 @@
  *
  * Run:   node mock/mock-server.js
  * Env:   PORT (default 8000), MOCK_SPEED (default 1; 0.5 = 2x faster lifecycle)
+ *        MOCK_AUTORUN_MS (default 1500): how long a job sits `queued` before the mock
+ *          auto-advances it. Set 0 to disable -> jobs wait for POST /jobs/<id>/run
+ *          (the two-sided demo where the seller's Run button is causal).
  *
- * A submitted job advances queued -> running -> docked -> proven -> settled over
- * ~10s so polling/stepper UIs animate. Submit with receptor.pdb_id === "FAIL"
- * to drive a job to the failed/refunded path.
+ * A job is created `queued`. It begins advancing (running -> docked -> proven -> settled,
+ * ~8s) when a provider calls POST /jobs/<id>/run, OR when the auto-run fallback fires.
+ * Submit with receptor.pdb_id === "FAIL" to drive a job to the failed/refunded path.
  */
 const http = require('http');
 const crypto = require('crypto');
 
 const PORT = process.env.PORT || 8000;
 const SPEED = parseFloat(process.env.MOCK_SPEED || '1');
+const AUTORUN_MS =
+  process.env.MOCK_AUTORUN_MS !== undefined
+    ? parseInt(process.env.MOCK_AUTORUN_MS, 10)
+    : 1500;
 const jobs = new Map();
 
 const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
@@ -63,21 +70,39 @@ function buildProof(job) {
   };
 }
 
-function advance(job) {
+// Start the docking lifecycle for a queued job. Idempotent: a job advances once,
+// whether triggered by POST /jobs/<id>/run or the auto-run fallback.
+function startAdvance(job, workerId) {
+  if (job._started || job.state !== 'queued') return false;
+  job._started = true;
+  if (job._autorun) { clearTimeout(job._autorun); job._autorun = null; }
+  if (workerId) { job.worker_id = workerId; job.escrow.supplier_id = workerId; }
+  else if (!job.worker_id) job.worker_id = job.escrow.supplier_id || 'node-1';
+
   const t = (sec) => sec * 1000 * SPEED;
+  const live = () => jobs.has(job.job_id);
   const fail = job.spec.receptor && job.spec.receptor.pdb_id === 'FAIL';
-  setTimeout(() => { if (jobs.has(job.job_id) && job.state === 'queued') job.state = 'running'; }, t(2));
+  job.state = 'running';
   if (fail) {
     setTimeout(() => {
+      if (!live()) return;
       job.state = 'failed';
       job.reason = 'docking failed: gnina returned no poses (mock)';
       job.escrow.state = 'refunded';
-    }, t(5));
-    return;
+    }, t(3));
+    return true;
   }
-  setTimeout(() => { job.state = 'docked'; job.result = buildResult(job); }, t(6));
-  setTimeout(() => { job.state = 'proven'; job.proof = buildProof(job); }, t(8));
-  setTimeout(() => { job.state = 'settled'; job.escrow.state = 'released'; }, t(10));
+  setTimeout(() => { if (live()) { job.state = 'docked'; job.result = buildResult(job); } }, t(4));
+  setTimeout(() => { if (live()) { job.state = 'proven'; job.proof = buildProof(job); } }, t(6));
+  setTimeout(() => { if (live()) { job.state = 'settled'; job.escrow.state = 'released'; } }, t(8));
+  return true;
+}
+
+// Buyer-side convenience: unless disabled (MOCK_AUTORUN_MS=0), a submitted job
+// auto-advances after a short queued dwell so the buyer-only demo still animates.
+function scheduleAutoRun(job) {
+  if (AUTORUN_MS <= 0) return;
+  job._autorun = setTimeout(() => startAdvance(job), AUTORUN_MS * SPEED);
 }
 
 function validateSpec(b) {
@@ -121,6 +146,7 @@ const server = http.createServer((req, res) => {
       const job_id = crypto.randomUUID();
       const job = {
         job_id, state: 'queued', reason: '', created_at: new Date().toISOString(), spec: body,
+        worker_id: null,
         escrow: {
           state: 'held',
           amount: (body.payment && body.payment.amount) || 0,
@@ -129,8 +155,26 @@ const server = http.createServer((req, res) => {
         result: null, proof: null,
       };
       jobs.set(job_id, job);
-      advance(job);
+      scheduleAutoRun(job);
       return send(res, 202, { job_id, state: 'queued' });
+    });
+    return;
+  }
+
+  // Supply side: a provider claims + starts a queued job.
+  if (parts[0] === 'jobs' && parts[1] && parts[2] === 'run' && req.method === 'POST') {
+    const job = jobs.get(parts[1]);
+    if (!job) return send(res, 404, { error: 'job not found' });
+    let data = '';
+    req.on('data', (c) => (data += c));
+    req.on('end', () => {
+      let body = {};
+      try { body = JSON.parse(data || '{}'); } catch { /* empty body is fine */ }
+      if (job.state !== 'queued')
+        return send(res, 409, { error: `job not claimable (state=${job.state})` });
+      const workerId = body.supplier_id || 'node-1';
+      startAdvance(job, workerId);
+      return send(res, 202, { job_id: job.job_id, state: job.state, worker_id: job.worker_id });
     });
     return;
   }
