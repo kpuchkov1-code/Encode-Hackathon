@@ -25,6 +25,8 @@ export interface StructureStore {
   setPdbId: (id: string) => void;
   /** Load raw PDB text directly (e.g. from an uploaded/cleaned file). */
   loadText: (text: string, label?: string) => void;
+  /** Load a named PDB structure directly (sets the displayed id + text), no refetch. */
+  loadStructure: (pdbId: string, text: string, source?: string) => void;
   text: string | null;
   parsed: ParsedStructure | null;
   status: StructureStatus;
@@ -60,6 +62,18 @@ export function StructureProvider({
     setStatus("ready");
     setSource(label);
   }, []);
+
+  const loadStructure = useCallback(
+    (id: string, raw: string, src = "RCSB") => {
+      manualRef.current = true;
+      setPdbIdState(id.trim().toUpperCase());
+      setText(raw);
+      setParsed(parsePdb(raw));
+      setStatus("ready");
+      setSource(src);
+    },
+    [],
+  );
 
   const id = pdbId.trim().toUpperCase();
   const validId = id.length >= 4 && id !== "FAIL";
@@ -99,8 +113,8 @@ export function StructureProvider({
   }, [id, validId]);
 
   const value = useMemo<StructureStore>(
-    () => ({ pdbId, setPdbId, loadText, text, parsed, status, source }),
-    [pdbId, setPdbId, loadText, text, parsed, status, source],
+    () => ({ pdbId, setPdbId, loadText, loadStructure, text, parsed, status, source }),
+    [pdbId, setPdbId, loadText, loadStructure, text, parsed, status, source],
   );
 
   return (

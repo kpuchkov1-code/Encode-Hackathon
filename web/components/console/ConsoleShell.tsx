@@ -10,6 +10,7 @@ import { useState } from "react";
 import { SelectionProvider } from "@/lib/selection";
 import { StructureProvider } from "@/lib/structureStore";
 import { FilesProvider } from "@/lib/files";
+import { JobProvider } from "@/lib/jobStore";
 import { StructurePane } from "./StructurePane";
 import { FilesPanel } from "./FilesPanel";
 import { ChatPane } from "./ChatPane";
@@ -22,6 +23,7 @@ export function ConsoleShell() {
     <SelectionProvider>
       <StructureProvider initialPdbId="6LU7">
         <FilesProvider>
+        <JobProvider>
         <div className="flex h-[calc(100vh-3.5rem)] w-full overflow-hidden">
           {/* Left — files */}
           <SidePane
@@ -52,6 +54,7 @@ export function ConsoleShell() {
             </div>
           </SidePane>
         </div>
+        </JobProvider>
         </FilesProvider>
       </StructureProvider>
     </SelectionProvider>
