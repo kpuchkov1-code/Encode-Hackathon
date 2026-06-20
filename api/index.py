@@ -13,6 +13,7 @@ import math
 import os
 import secrets
 import sys
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -88,6 +89,16 @@ _BASE_CSS = """
   .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; }
   .badge.online { background: #dcfce7; color: var(--ok); }
   .badge.offline { background: #f1f5f9; color: var(--muted); }
+  .badge.pending_payment { background: #f1f5f9; color: var(--muted); }
+  .badge.queued { background: #e0e7ff; color: #4338ca; }
+  .badge.running { background: #fef3c7; color: #b45309; }
+  .badge.docked { background: #dbeafe; color: #1d4ed8; }
+  .badge.verifying { background: #ede9fe; color: #6d28d9; }
+  .badge.proven, .badge.settled { background: #dcfce7; color: var(--ok); }
+  .badge.disputed, .badge.failed { background: #fee2e2; color: var(--bad); }
+  .badge.kind { background: #f1f5f9; color: var(--muted); font-size: 11px; }
+  td.mono, code.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .muted { color: var(--muted); }
   .price { font-size: 32px; font-weight: 700; color: var(--accent); margin: 8px 0; }
   .stat { display: inline-block; margin-right: 28px; }
   .stat .n { font-size: 22px; font-weight: 700; display: block; }
@@ -929,54 +940,203 @@ def _require_admin(credentials: HTTPBasicCredentials = Depends(_admin_auth)) -> 
         raise HTTPException(status_code=401, detail="invalid admin credentials", headers={"WWW-Authenticate": "Basic"})
 
 
+def _short(s: Optional[str], n: int = 8) -> str:
+    """First n chars of an id, for compact tables. Empty/None -> em dash."""
+    return (s[:n] if s else "—")
+
+
+def _age(iso: Optional[str]) -> str:
+    """Human 'time since' for an ISO timestamp (e.g. '12s', '4m', '2h', '3d')."""
+    if not iso:
+        return "—"
+    try:
+        then = datetime.fromisoformat(iso)
+        if then.tzinfo is None:
+            then = then.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return "—"
+    secs = (datetime.now(timezone.utc) - then).total_seconds()
+    if secs < 90:
+        return f"{int(secs)}s"
+    if secs < 5400:
+        return f"{int(secs // 60)}m"
+    if secs < 172800:
+        return f"{int(secs // 3600)}h"
+    return f"{int(secs // 86400)}d"
+
+
+def _state_badge(state: str) -> str:
+    return f'<span class="badge {state}">{state}</span>'
+
+
+def _job_links(job: dict) -> str:
+    jid = job["job_id"]
+    return f'<a class="mono" href="/jobs/{jid}/page">{jid[:8]}</a>'
+
+
 @app.get("/admin/dashboard", response_class=HTMLResponse)
 def admin_dashboard(_: None = Depends(_require_admin)) -> str:
-    workers = [models.get_worker(wid) for wid in models.list_workers()]
-    researchers = [models.get_researcher(rid) for rid in models.list_researchers()]
-    workers = [w for w in workers if w is not None]
-    researchers = [r for r in researchers if r is not None]
+    workers = [w for w in (models.get_worker(wid) for wid in models.list_workers()) if w]
+    researchers = [r for r in (models.get_researcher(rid) for rid in models.list_researchers()) if r]
+    jobs = models.list_all_jobs()
 
+    # Newest first; verification jobs carry no price/researcher (internal re-runs).
+    jobs.sort(key=lambda j: j.get("created_at", ""), reverse=True)
+    worker_addr = {w["worker_id"]: w for w in workers}
+
+    # ---- aggregate counts -------------------------------------------------------------
+    ACTIVE_STATES = ("pending_payment", "queued", "running", "docked", "verifying")
+    TERMINAL_STATES = ("settled", "proven", "disputed", "failed")
+    by_state: dict[str, int] = {}
+    for j in jobs:
+        by_state[j.get("state", "?")] = by_state.get(j.get("state", "?"), 0) + 1
+    active_jobs = [j for j in jobs if j.get("state") in ACTIVE_STATES]
+
+    online_count = sum(1 for w in workers if w["status"] == "online")
     total_jobs_completed = sum(w.get("jobs_completed", 0) for w in workers)
     total_earned = sum(w.get("total_earned", 0) for w in workers)
-    online_count = sum(1 for w in workers if w["status"] == "online")
+    total_spent = sum(r.get("total_spent", 0) for r in researchers)
+    walrus_anchored = sum(1 for j in jobs if j.get("walrus"))
+    verified_ok = sum(1 for j in jobs if (j.get("verification") or {}).get("status") == "passed")
 
+    # Escrow currently locked = held escrows across all jobs. Fetch each once and reuse
+    # for both the held-total and the per-row escrow column.
+    escrows = {j["job_id"]: models.escrow_status(j["job_id"]) for j in jobs}
+    held_total = sum(e.get("amount", 0) for e in escrows.values() if e and e.get("state") == "held")
+
+    onchain = "on-chain (Sui testnet)" if models.SUI_ONCHAIN else "mock (off-chain)"
+
+    # ---- stat strip -------------------------------------------------------------------
+    def stat(n, label):
+        return f'<div class="stat"><span class="n">{n}</span><span class="l">{label}</span></div>'
+
+    stats = "".join([
+        stat(len(jobs), "total jobs"),
+        stat(len(active_jobs), "active now"),
+        stat(by_state.get("running", 0), "running"),
+        stat(by_state.get("verifying", 0), "verifying"),
+        stat(by_state.get("settled", 0) + by_state.get("proven", 0), "settled"),
+        stat(by_state.get("disputed", 0) + by_state.get("failed", 0), "disputed/failed"),
+        stat(f"{online_count}/{len(workers)}", "providers online"),
+        stat(len(researchers), "researchers"),
+        stat(f"{held_total:g}", "escrow held"),
+        stat(f"{total_spent:g}", "researcher spend"),
+        stat(f"{total_earned:g}", "provider earned"),
+        stat(walrus_anchored, "Walrus-anchored"),
+    ])
+
+    # ---- active jobs table (the live view) --------------------------------------------
+    def active_row(j):
+        prov = j.get("claimed_by")
+        prov_cell = f'<a class="mono" href="/workers/{prov}">{prov[:10]}</a>' if prov else '<span class="muted">unclaimed</span>'
+        kind = j.get("kind", "primary")
+        kind_badge = f' <span class="badge kind">{kind}</span>' if kind != "primary" else ""
+        nlig = count_ligands(j.get("spec", {}).get("ligands_sdf", ""))
+        price = j.get("price")
+        price_cell = f"${price:g}" if price is not None else "—"
+        return f"""<tr>
+          <td>{_job_links(j)}{kind_badge}</td>
+          <td>{_state_badge(j.get('state','?'))}</td>
+          <td>{prov_cell}</td>
+          <td>{nlig}</td>
+          <td>{price_cell}</td>
+          <td>{j.get('attempts', 0)}</td>
+          <td class="muted">{_age(j.get('started_at') or j.get('created_at'))}</td>
+        </tr>"""
+
+    active_rows = "".join(active_row(j) for j in active_jobs) or '<tr><td colspan=7 class="muted">No active jobs</td></tr>'
+
+    # ---- all jobs table ---------------------------------------------------------------
+    def job_row(j):
+        v = (j.get("verification") or {}).get("status")
+        v_cell = {"passed": "✓ verified", "failed": "✗ disputed", "inconclusive": "~ inconclusive",
+                  "skipped": "— skipped", "pending": "… pending"}.get(v, "—")
+        esc = escrows.get(j["job_id"])
+        esc_cell = esc.get("state") if esc else "—"
+        walrus = j.get("walrus")
+        w_cell = f'<a href="{walrus["aggregator_url"]}">blob</a>' if walrus else "—"
+        rid = j.get("researcher_id")
+        prov = j.get("claimed_by")
+        kind = j.get("kind", "primary")
+        kind_badge = f' <span class="badge kind">{kind}</span>' if kind != "primary" else ""
+        price = j.get("price")
+        return f"""<tr>
+          <td>{_job_links(j)}{kind_badge}</td>
+          <td>{_state_badge(j.get('state','?'))}</td>
+          <td class="mono muted">{_short(rid)}</td>
+          <td class="mono muted">{_short(prov, 10)}</td>
+          <td>{count_ligands(j.get('spec', {}).get('ligands_sdf', ''))}</td>
+          <td>{('$' + format(price, 'g')) if price is not None else '—'}</td>
+          <td>{esc_cell}</td>
+          <td>{v_cell}</td>
+          <td>{w_cell}</td>
+          <td class="muted">{_age(j.get('created_at'))}</td>
+        </tr>"""
+
+    MAX_ROWS = 60
+    shown = jobs[:MAX_ROWS]
+    overflow = f'<p class="muted">Showing newest {MAX_ROWS} of {len(jobs)} jobs.</p>' if len(jobs) > MAX_ROWS else ""
+    job_rows = "".join(job_row(j) for j in shown) or '<tr><td colspan=10 class="muted">No jobs yet</td></tr>'
+
+    # ---- providers table --------------------------------------------------------------
     worker_rows = "".join(f"""
       <tr>
-        <td>{w['worker_id']}</td>
+        <td class="mono"><a href="/workers/{w['worker_id']}">{w['worker_id'][:14]}</a></td>
         <td><span class="badge {w['status']}">{w['status']}</span></td>
-        <td>{w.get('hardware_info', '')}</td>
+        <td class="muted">{_age(w.get('last_seen') or w.get('registered_at'))}</td>
+        <td>{w.get('hardware_info', '') or '<span class="muted">unknown</span>'}</td>
+        <td class="mono muted">{_short(w.get('sui_address'), 12)}</td>
         <td>{w.get('jobs_completed', 0)}</td>
-        <td>{w.get('total_earned', 0)}</td>
-      </tr>""" for w in workers) or "<tr><td colspan=5>None yet</td></tr>"
+        <td>{w.get('total_earned', 0):g}</td>
+      </tr>""" for w in workers) or '<tr><td colspan=7 class="muted">None yet</td></tr>'
 
     researcher_rows = "".join(f"""
       <tr>
-        <td>{r['researcher_id']}</td>
+        <td class="mono">{_short(r['researcher_id'], 14)}</td>
         <td>{r.get('email', '')}</td>
         <td>{r.get('jobs_submitted', 0)}</td>
-        <td>{r.get('total_spent', 0)}</td>
-      </tr>""" for r in researchers) or "<tr><td colspan=4>None yet</td></tr>"
+        <td>{r.get('total_spent', 0):g}</td>
+      </tr>""" for r in researchers) or '<tr><td colspan=4 class="muted">None yet</td></tr>'
 
     return page("Admin dashboard", f"""
+    <meta http-equiv="refresh" content="8">
+    <style>.wrap{{max-width:1100px}}</style>
     <h1>Admin dashboard</h1>
+    <p class="lede">Live marketplace state · escrow mode: <strong>{onchain}</strong> ·
+      queue depth {models.queue_depth()} · running set {models.running_count()} ·
+      auto-refresh 8s</p>
+
+    <div class="card">{stats}</div>
+
+    <h2>Active jobs ({len(active_jobs)})</h2>
     <div class="card">
-      <div class="stat"><span class="n">{len(workers)}</span><span class="l">registered providers</span></div>
-      <div class="stat"><span class="n">{online_count}</span><span class="l">online now</span></div>
-      <div class="stat"><span class="n">{len(researchers)}</span><span class="l">registered researchers</span></div>
-      <div class="stat"><span class="n">{total_jobs_completed}</span><span class="l">jobs completed</span></div>
-      <div class="stat"><span class="n">{total_earned}</span><span class="l">total earned (proxy)</span></div>
+      <table>
+        <tr><th>Job</th><th>State</th><th>Provider</th><th>Ligands</th><th>Price</th><th>Try</th><th>Age</th></tr>
+        {active_rows}
+      </table>
     </div>
 
-    <h2>Hardware providers</h2>
+    <h2>All jobs</h2>
+    {overflow}
     <div class="card">
-      <table><tr><th>Worker ID</th><th>Status</th><th>Hardware</th><th>Jobs done</th><th>Earned</th></tr>
+      <table>
+        <tr><th>Job</th><th>State</th><th>Researcher</th><th>Provider</th><th>Lig</th><th>Price</th>
+            <th>Escrow</th><th>Verification</th><th>Walrus</th><th>Age</th></tr>
+        {job_rows}
+      </table>
+    </div>
+
+    <h2>Hardware providers ({online_count} online)</h2>
+    <div class="card">
+      <table>
+        <tr><th>Worker</th><th>Status</th><th>Last seen</th><th>Hardware</th><th>Sui payout</th><th>Jobs</th><th>Earned</th></tr>
         {worker_rows}
       </table>
     </div>
 
     <h2>Researchers</h2>
     <div class="card">
-      <table><tr><th>Researcher ID</th><th>Email</th><th>Jobs submitted</th><th>Spent</th></tr>
+      <table><tr><th>Researcher</th><th>Email</th><th>Submitted</th><th>Spent</th></tr>
         {researcher_rows}
       </table>
     </div>

@@ -458,3 +458,31 @@ def increment_researcher_stats(researcher_id: str, *, submitted: bool = False, s
 
 def list_researchers() -> list[str]:
     return _cmd("SMEMBERS", RESEARCHERS_SET_KEY) or []
+
+
+def list_all_jobs() -> list[dict]:
+    """Every job record (primary + verification), for the admin dashboard. No global job
+    index is maintained elsewhere, so this SCANs the `job:*` keyspace -- fine for the
+    dashboard's scale and not a hot path. Captures pre-existing jobs with no migration."""
+    jobs = []
+    cursor = "0"
+    while True:
+        resp = _cmd("SCAN", cursor, "MATCH", "job:*", "COUNT", "200")
+        cursor, keys = resp[0], resp[1]
+        for k in keys or []:
+            raw = _cmd("GET", k)
+            if raw:
+                jobs.append(json.loads(raw))
+        if cursor == "0" or cursor == 0:
+            break
+    return jobs
+
+
+def queue_depth() -> int:
+    """How many jobs are waiting in the claim queue right now."""
+    return _cmd("LLEN", QUEUE_KEY) or 0
+
+
+def running_count() -> int:
+    """How many jobs are currently tracked as running (for the reclaim sweep)."""
+    return _cmd("SCARD", RUNNING_SET_KEY) or 0
