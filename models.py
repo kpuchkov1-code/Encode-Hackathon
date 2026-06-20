@@ -81,6 +81,7 @@ ESCROW_KEY = "escrow:{job_id}"
 QUEUE_KEY = "queued_jobs"
 RUNNING_SET_KEY = "running_jobs"
 WORKER_KEY = "worker:{worker_id}"
+WORKER_EMAIL_KEY = "worker_email:{email}"  # email -> worker_id (provider login lookup)
 WORKERS_SET_KEY = "registered_workers"
 RESEARCHER_KEY = "researcher:{researcher_id}"
 RESEARCHER_EMAIL_KEY = "researcher_email:{email}"  # email -> researcher_id (login lookup)
@@ -437,21 +438,41 @@ def escrow_status(job_id: str) -> dict | None:
 HEARTBEAT_TIMEOUT_SECONDS = 15  # daemon polls every ~3s; several missed polls = offline
 
 
-def create_worker_identity(sui_address: str = "") -> dict:
-    """Issues a brand-new worker_id + secret token at signup. The token must be
-    presented on every subsequent request made as this worker (registering detected
-    hardware, claiming jobs) -- this is what actually prevents two different people
-    from colliding on or impersonating the same worker_id, not just a free-text name
-    anyone could type in. Returned once, here; never echoed back afterwards.
+def get_worker_by_email(email: str) -> dict | None:
+    """Look up a provider by their email (the login key). Returns None if unknown."""
+    wid = _cmd("GET", WORKER_EMAIL_KEY.format(email=_norm_email(email)))
+    return get_worker(wid) if wid else None
+
+
+def create_worker_identity(sui_address: str = "", email: str = "") -> dict:
+    """Sign-up-or-sign-in by email, exactly like a researcher: the email is the
+    provider's identity and the worker_id + secret token are mapped from it server-side,
+    never typed in. Idempotent -- signing in again with the same email returns the SAME
+    worker_id + token, so a returning provider recovers their existing setup (and run
+    command) instead of accumulating duplicate identities. The token is what prevents two
+    different people from colliding on or impersonating the same worker_id.
 
     `sui_address` is where this provider gets paid: on a verified job the platform
-    releases the on-chain escrow directly to it. Optional (a provider can run without
-    one and just not receive real payouts yet)."""
+    releases the on-chain escrow directly to it. Optional (a provider can run without one
+    and just not receive real payouts yet); when supplied on a returning login it updates
+    the address on file.
+
+    Email is optional too, for backwards-compatible address-only signups -- but without it
+    there's no login key, so the worker_id + token are the only way back in."""
+    email = _norm_email(email)
+    if email:
+        existing = get_worker_by_email(email)
+        if existing is not None:
+            if sui_address.strip():
+                existing["sui_address"] = sui_address.strip()
+                _cmd("SET", WORKER_KEY.format(worker_id=existing["worker_id"]), json.dumps(existing))
+            return existing
     worker_id = f"worker-{uuid.uuid4().hex[:12]}"
     token = secrets.token_urlsafe(24)
     record = {
         "worker_id": worker_id,
         "token": token,
+        "email": email,
         "sui_address": sui_address.strip(),
         "hardware_info": "(pending -- starts once the daemon runs and detects it)",
         "registered_at": datetime.now(timezone.utc).isoformat(),
@@ -459,6 +480,8 @@ def create_worker_identity(sui_address: str = "") -> dict:
     }
     _cmd("SET", WORKER_KEY.format(worker_id=worker_id), json.dumps(record))
     _cmd("SADD", WORKERS_SET_KEY, worker_id)
+    if email:
+        _cmd("SET", WORKER_EMAIL_KEY.format(email=email), worker_id)
     return record
 
 

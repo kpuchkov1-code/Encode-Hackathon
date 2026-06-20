@@ -867,37 +867,42 @@ def worker_heartbeat(worker_id: str, auth: WorkerAuth) -> dict:
 def providers_signup_form() -> str:
     return page("Provide idle compute", """
     <h1>Provide idle compute</h1>
-    <p class="lede">Hardware is detected automatically by the daemon when it starts
-    (CPU cores, GPU if present) -- you don't need to describe it yourself. Your worker
-    ID and access token are generated for you, not typed in, so no two providers can
-    ever collide on or impersonate the same identity.</p>
+    <p class="lede">Just your email -- no password, no account ID to remember. New email
+    signs you up; a known email signs you back in and hands you the same setup command
+    again (so you never lose your worker token). Hardware is detected automatically by
+    the daemon when it starts (CPU cores, GPU if present) -- you don't describe it
+    yourself.</p>
     <div class="card">
       <form method="post" action="/providers/signup">
+        <label>Email</label>
+        <input type="email" name="email" required style="width:100%;margin:8px 0 16px">
         <label>Sui payout address (testnet) &mdash; where you get paid when a job you
         run is verified. A 66-character address starting with <code>0x</code>.
         <strong>Required</strong> &mdash; you can't be paid without it.</label>
         <input type="text" name="sui_address" placeholder="0x..." required
                pattern="0x[0-9a-fA-F]{64}" style="width:100%;margin:8px 0 16px">
-        <button type="submit">Sign up</button>
+        <button type="submit">Continue</button>
       </form>
     </div>
     """)
 
 
 @app.post("/providers/signup", response_class=HTMLResponse)
-def providers_signup_submit(request: Request, sui_address: str = Form(...)) -> str:
+def providers_signup_submit(request: Request, email: str = Form(...), sui_address: str = Form(...)) -> str:
     sui_address = sui_address.strip()
     if not _valid_sui_address(sui_address):
         raise HTTPException(status_code=400, detail="A valid Sui payout address (0x + 64 hex chars) is required.")
-    identity = models.create_worker_identity(sui_address=sui_address)
+    # Sign-up-or-sign-in by email (same model as researchers): a returning email recovers
+    # the existing worker_id + token rather than minting a duplicate identity.
+    identity = models.create_worker_identity(sui_address=sui_address, email=email)
     worker_id, token = identity["worker_id"], identity["token"]
     base_url = str(request.base_url).rstrip("/")
     run_cmd = f"CONTROL_PLANE_URL={base_url} WORKER_ID={worker_id} WORKER_TOKEN={token} ./install_worker.sh"
     return page(f"Signed up: {worker_id}", f"""
     <h1>Signed up: {worker_id}</h1>
-    <p class="warn"><strong>Save this command somewhere</strong> -- the token in it is
-    only shown once and cannot be recovered if lost (you'd need to sign up again for a
-    new identity).</p>
+    <p class="lede"><strong>Lost this command?</strong> Just
+    <a href="/providers/signup">sign in with the same email</a> any time to get it back --
+    your worker identity and token are tied to your email, not to this page.</p>
     <div class="card">
       <p>Follow these steps on the computer that will actually provide compute (it can
       be a different machine than the one you're signing up from). You do not need a
