@@ -15,6 +15,8 @@
 
 - :Job: is a persisted docking job record with these fields: `job_id` (a UUID string), `state` (a :JobState:), `reason` (a string that is empty unless the state is "failed"), `created_at` (an ISO 8601 timestamp string), and the submitted :JobSpec:.
 
+- :Escrow: is a per-job payment hold, and is a stand-in for on-chain DeepBook settlement. For each :Job: it tracks an escrow state that is one of "held", "released", or "refunded", together with the held `amount` and the `supplier_id` taken from the job's `payment`. Payment is held when the job is created, is released only against a valid proof of execution, and is refunded if the job fails.
+
 ***implementation reqs***
 
 - :App: should be implemented in Python (version 3.11 or newer) using the Flask framework.
@@ -26,6 +28,8 @@
 - JSON keys in request and response bodies should use snake_case.
 
 - :App: should persist :Job: records in a SQLite database stored in a local file. The database file path should default to "jobs.db" and be configurable through the `DOCKING_DB_PATH` environment variable. The database schema should be created automatically on startup if it does not already exist.
+
+- :App: should record :Escrow: state in a JSON ledger file, defaulting to "escrow_ledger.json" and configurable through the `DOCKING_ESCROW_PATH` environment variable. The ledger maps each `job_id` to its escrow record.
 
 ***test reqs***
 
@@ -58,3 +62,11 @@
   - After creating a :Job: with a valid "POST /jobs" request, a "GET /jobs/<job_id>" for the returned `job_id` returns HTTP status 200 and a `state` of "queued".
 
   - A "GET /jobs/<job_id>" request for a `job_id` that does not exist returns HTTP status 404.
+
+- When a :Job: is created by a successful "POST /jobs" request, :App: holds an :Escrow: for that job with state "held", an `amount` equal to the job's `payment.amount`, and a `supplier_id` equal to the job's `payment.supplier_id`. Implement :Endpoint: "GET /jobs/<job_id>/escrow" that returns the :Escrow: record for the job as a JSON body with fields `state`, `amount`, and `supplier_id`, and HTTP status 200 if the :Job: exists, or HTTP status 404 if no such :Job: exists.
+
+  ***acceptance tests***
+
+  - After a successful "POST /jobs" request, a "GET /jobs/<job_id>/escrow" request for that job returns HTTP status 200, a `state` of "held", and an `amount` equal to the submitted `payment.amount`.
+
+  - A "GET /jobs/<job_id>/escrow" request for a `job_id` that does not exist returns HTTP status 404.
