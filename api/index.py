@@ -25,7 +25,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field, model_validator
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import deepbook_oracle  # noqa: E402
+import deepbook_log  # noqa: E402
 import models  # noqa: E402
 import walrus  # noqa: E402
 
@@ -137,9 +137,16 @@ def page(title: str, body: str) -> str:
 # dependency-free heuristic (every molecule in a standard SDF ends with a "$$$$" line).
 # --------------------------------------------------------------------------------------
 
-PRICE_PER_LIGAND_AT_BASELINE = 2.0  # USD-equivalent units; arbitrary placeholder rate
-BASELINE_EXHAUSTIVENESS = 8
-MIN_PRICE = 1.0
+# Fixed, low, per-ligand price -- one flat rate per ligand docked, independent of
+# exhaustiveness. Deliberately simple and cheap: a researcher can read the price off the
+# ligand count alone, with no surprises. (A future version could let providers quote their
+# own per-unit price for researchers to accept/decline; for now it's a fixed platform rate.)
+# DeepBook is no longer in the pricing path -- it's used purely to log settled jobs on-chain
+# (see deepbook_log.py); standing up a live price oracle needs a funded pool, which is out
+# of scope for now.
+PRICE_PER_LIGAND = float(os.environ.get("PRICE_PER_LIGAND", "0.0001"))
+BASELINE_EXHAUSTIVENESS = 8  # retained for the engine params, not used in pricing anymore
+MIN_PRICE = float(os.environ.get("MIN_PRICE", "0.0001"))
 
 # --- Execution verification (optimistic, sampled re-execution) ------------------------
 # A fraction of a completed job's ligands are re-docked by an *independent* worker with
@@ -202,22 +209,10 @@ def sample_ligands_for_verification(ligands_sdf: str, fraction: float, seed_text
     return "".join(blocks[i] for i in chosen)
 
 
-def _baseline_rate_per_ligand() -> tuple[float, dict | None]:
-    """The per-ligand rate to charge, plus the live-market context it came from (or None).
-
-    Falls back to the static PRICE_PER_LIGAND_AT_BASELINE whenever the DeepBook oracle is
-    unavailable (e.g. on Vercel, where the Node bridge isn't deployed) -- pricing must never
-    depend on the order book being reachable, same best-effort contract as Walrus."""
-    market = deepbook_oracle.live_market(PRICE_PER_LIGAND_AT_BASELINE)
-    if market:
-        return market["price_per_ligand"], market
-    return PRICE_PER_LIGAND_AT_BASELINE, None
-
-
-def estimate_price(num_ligands: int, exhaustiveness: int) -> float:
-    rate, _ = _baseline_rate_per_ligand()
-    price = rate * num_ligands * (exhaustiveness / BASELINE_EXHAUSTIVENESS)
-    return round(max(price, MIN_PRICE), 2)
+def estimate_price(num_ligands: int, exhaustiveness: int = 0) -> float:
+    """Fixed price: a flat per-ligand rate times the ligand count. exhaustiveness is
+    accepted for signature compatibility but no longer affects the price."""
+    return round(max(PRICE_PER_LIGAND * num_ligands, MIN_PRICE), 6)
 
 
 def default_box_from_receptor(pdb_text: str) -> dict:
@@ -330,22 +325,12 @@ def estimate_job(job_spec: JobSpec) -> dict:
     """Dry-run pricing -- no job is created. Needed by the frontend (Kirill's
     workstream) to show a price before the researcher commits to anything."""
     num_ligands = count_ligands(job_spec.ligands_sdf)
-    rate, market = _baseline_rate_per_ligand()
-    price = round(max(rate * num_ligands * (job_spec.params.exhaustiveness / BASELINE_EXHAUSTIVENESS), MIN_PRICE), 2)
-    out = {"price": price, "num_ligands": num_ligands}
-    if market:
-        # Provenance so the UI can show the price came from a live DeepBook order book.
-        out["pricing"] = {
-            "source": "deepbook",
-            "pool_key": market["pool_key"],
-            "pool_id": market["pool_id"],
-            "sui_per_compute_unit": market["sui_per_compute_unit"],
-            "rate_per_ligand": rate,
-            "note": market["note"],
-        }
-    else:
-        out["pricing"] = {"source": "baseline", "rate_per_ligand": rate}
-    return out
+    price = estimate_price(num_ligands)
+    return {
+        "price": price,
+        "num_ligands": num_ligands,
+        "pricing": {"source": "fixed", "rate_per_ligand": PRICE_PER_LIGAND},
+    }
 
 
 @app.post("/jobs", status_code=202)
@@ -636,48 +621,39 @@ def _suiscan(kind: str, ident: str) -> str:
     return f"https://suiscan.xyz/testnet/{kind}/{ident}"
 
 
-def _pricing_badge_html(market: dict | None) -> str:
-    """Show that the quoted price came from a live DeepBook order book (with a Suiscan link
-    to the pool anyone can inspect), or nothing when the oracle is unavailable and the static
-    baseline rate was used -- so deploys without the Node bridge look unchanged."""
-    if not market:
-        return ""
-    pool_id = market.get("pool_id")
-    pool_link = (
-        f'<a href="{_suiscan("object", pool_id)}">{market.get("pool_key")}</a>'
-        if pool_id else (market.get("pool_key") or "")
-    )
-    rate = market.get("sui_per_compute_unit")
-    note = market.get("note") or ""
-    return (
-        '<p class="lede" style="font-size:0.9em;opacity:0.85">'
-        f'⛓ Priced from the live DeepBook pool {pool_link} '
-        f'(best compute rate {rate:g} SUI/unit). '
-        f'<span class="hint">{note}</span></p>'
-    )
-
-
 def _escrow_chain_html(job_id: str) -> str:
     """Render the on-chain escrow trail (lock/release/refund tx digests + escrow object)
     as Suiscan links, when the job's escrow was settled on Sui. Renders nothing for
     mock (off-chain) escrow so unconfigured deploys look unchanged."""
     escrow = models.escrow_status(job_id)
     chain = (escrow or {}).get("chain")
-    if not chain:
+    rows = []
+    if chain:
+        sui = f"{chain.get('amount_mist', 0) / 1_000_000_000:.4f} SUI"
+        rows.append(f"<p><strong>Escrow on Sui testnet:</strong> {sui}</p>")
+        if chain.get("payer"):
+            rows.append(f'<p>Locked by researcher (their own wallet): <a href="{_suiscan("account", chain["payer"])}">{chain["payer"][:18]}…</a></p>')
+        if chain.get("lock_digest"):
+            rows.append(f'<p>Lock tx: <a href="{_suiscan("tx", chain["lock_digest"])}">{chain["lock_digest"][:18]}…</a></p>')
+        if chain.get("escrow_object_id"):
+            rows.append(f'<p>Escrow object: <a href="{_suiscan("object", chain["escrow_object_id"])}">{chain["escrow_object_id"][:18]}…</a></p>')
+        for label, key in (("Release", "release_digest"), ("Refund", "refund_digest")):
+            if chain.get(key):
+                rows.append(f'<p>{label} tx: <a href="{_suiscan("tx", chain[key])}">{chain[key][:18]}…</a></p>')
+        if chain.get("paid_to"):
+            rows.append(f'<p>Paid to provider: <a href="{_suiscan("object", chain["paid_to"])}">{chain["paid_to"][:18]}…</a></p>')
+    # DeepBook settlement log: the marketplace transaction recorded on Sui's on-chain order
+    # book (an opaque compute-unit count only). Independent of the escrow trail above.
+    deepbook = (models.get_job(job_id) or {}).get("deepbook")
+    if deepbook and deepbook.get("digest"):
+        rows.append(
+            f'<p><strong>DeepBook log:</strong> settled '
+            f'{deepbook.get("compute_units", "?")} compute unit(s) recorded on the '
+            f'<a href="{_suiscan("object", deepbook.get("pool_id", ""))}">{deepbook.get("pool", "DEEP/SUI")}</a> '
+            f'order book &mdash; <a href="{_suiscan("tx", deepbook["digest"])}">{deepbook["digest"][:18]}…</a></p>'
+        )
+    if not rows:
         return ""
-    sui = f"{chain.get('amount_mist', 0) / 1_000_000_000:.4f} SUI"
-    rows = [f"<p><strong>Escrow on Sui testnet:</strong> {sui}</p>"]
-    if chain.get("payer"):
-        rows.append(f'<p>Locked by researcher (their own wallet): <a href="{_suiscan("account", chain["payer"])}">{chain["payer"][:18]}…</a></p>')
-    if chain.get("lock_digest"):
-        rows.append(f'<p>Lock tx: <a href="{_suiscan("tx", chain["lock_digest"])}">{chain["lock_digest"][:18]}…</a></p>')
-    if chain.get("escrow_object_id"):
-        rows.append(f'<p>Escrow object: <a href="{_suiscan("object", chain["escrow_object_id"])}">{chain["escrow_object_id"][:18]}…</a></p>')
-    for label, key in (("Release", "release_digest"), ("Refund", "refund_digest")):
-        if chain.get(key):
-            rows.append(f'<p>{label} tx: <a href="{_suiscan("tx", chain[key])}">{chain[key][:18]}…</a></p>')
-    if chain.get("paid_to"):
-        rows.append(f'<p>Paid to provider: <a href="{_suiscan("object", chain["paid_to"])}">{chain["paid_to"][:18]}…</a></p>')
     return '<div class="card">' + "".join(rows) + "</div>"
 
 
@@ -769,6 +745,11 @@ def _settle_primary(job: dict, *, note: str | None = None) -> None:
         models.update_job(job_id, state="settled")
         if job.get("claimed_by"):
             models.increment_worker_stats(job["claimed_by"], completed=True, earned=job.get("price", 0))
+        # Best-effort: record the settled transaction on DeepBook (an opaque compute-unit
+        # count, never anything identifying). A logging hiccup must never affect settlement.
+        entry = deepbook_log.log_settlement(count_ligands(job.get("spec", {}).get("ligands_sdf", "")))
+        if entry:
+            models.update_job_extra(job_id, deepbook=entry)
     if note:
         models.update_job_extra(job_id, verification={"status": "skipped", "reason": note})
 
@@ -1250,8 +1231,10 @@ async def researchers_submit_handler(
     created = submit_job(job_spec)
     job_id, price = created["job_id"], created["price"]
     num_ligands = created.get("num_ligands", count_ligands(ligands_sdf))
-    _rate, market = _baseline_rate_per_ligand()
-    pricing_badge = _pricing_badge_html(market)
+    pricing_badge = (
+        f'<p class="lede" style="font-size:0.9em;opacity:0.85">Flat rate: '
+        f'${PRICE_PER_LIGAND:g} per ligand &times; {num_ligands} ligand(s).</p>'
+    )
     if models.SUI_ONCHAIN:
         # Real on-chain settlement: send the researcher to the wallet-connect pay page,
         # where their own wallet signs the escrow lock. The job queues only after that.

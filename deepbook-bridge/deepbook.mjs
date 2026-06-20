@@ -1,18 +1,22 @@
 /**
- * DeepBook v3 bridge for the docking marketplace.
+ * DeepBook v3 bridge -- on-chain settlement LOG for the docking marketplace.
  *
- * Isolated from the v1 escrow bridge (sui-bridge/) because DeepBook needs @mysten/sui v2
- * while the escrow signer pins v1.45.2 -- the two SDKs cannot share a node_modules.
+ * DeepBook here is a public, tamper-evident ledger of marketplace activity: when a job
+ * settles, we place a tiny marker order on an existing testnet pool, and that order is a
+ * permanent on-chain DeepBook event anyone can inspect on Suiscan. It is NOT a price oracle
+ * and NOT a matcher -- pricing is a fixed platform rate and matching/settlement is done by
+ * the pull queue + Sui escrow. (A future version could turn this into a real compute market
+ * with provider-quoted prices; that needs a funded pool, out of scope for now.)
  *
- * Primary job: act as a *price oracle*. Providers post generic compute-unit ask orders on
- * a DeepBook COMPUTE/SUI pool; the control plane reads the live best-ask here and uses it
- * to price every docking job. DeepBook is NOT used to match or settle jobs (the pull-queue
- * + Sui escrow already do that) and orders carry only an opaque compute-unit quantity and
- * price -- never anything that identifies a job, protein, or ligand.
+ * Why an existing pool (DEEP/SUI): creating our own pool costs a fixed 500-DEEP fee. By
+ * logging onto the existing, zero-fee DEEP/SUI pool we avoid that fee entirely -- a marker
+ * order needs only a sliver of SUI and gas, no DEEP at all.
  *
- * The same module also exposes the one-shot setup ops (mint COMPUTE, create the pool, open
- * a balance manager, seed ask orders) used to stand the pool up; those need SUI_PLATFORM_KEY
- * and, for pool creation, ~500 DEEP of gas-token.
+ * Privacy: the marker carries only an opaque compute-unit COUNT (the ligand count), encoded
+ * as the order quantity / client order id. Nothing job-, protein-, or ligand-identifying
+ * ever touches the public book -- same rule as Walrus and the escrow contract.
+ *
+ * Isolated from the v1 escrow bridge (sui-bridge/) because DeepBook needs @mysten/sui v2.
  */
 import { DeepBookClient } from '@mysten/deepbook-v3';
 import { testnetCoins, testnetPools } from '@mysten/deepbook-v3';
@@ -23,33 +27,19 @@ import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 const RPC_URL = process.env.SUI_RPC_URL || getJsonRpcFullnodeUrl('testnet');
 const NETWORK = process.env.SUI_NETWORK || 'testnet';
 
-// COMPUTE coin published by us (move/compute_token). Defaults baked in so the read path
-// works with zero extra env, but every value is overridable.
-const COMPUTE_TYPE =
-  process.env.DEEPBOOK_COMPUTE_COIN_TYPE ||
-  '0x9fb8d8ec2e4e7df75fe47edbe63f20dc58b4db547d6abe9ff2b4be6d80b75d38::compute::COMPUTE';
-const COMPUTE_PKG = COMPUTE_TYPE.split('::')[0];
-const COMPUTE_TREASURY =
-  process.env.DEEPBOOK_COMPUTE_TREASURY ||
-  '0x404512e1d361fe13ce6cafeb6e728ad330f4b9f0ac8636b6aa0105e1d5d36be8';
-const COMPUTE_SCALAR = 1_000_000; // 6 decimals, matches the Move create_currency decimals
-
-// Set once the COMPUTE/SUI pool exists (funding-gated). Until then the oracle reads a live
-// reference pool so the plumbing is provably real, and labels the source honestly.
-const COMPUTE_POOL_ID = process.env.DEEPBOOK_COMPUTE_POOL_ID || '';
-const REFERENCE_POOL_KEY = process.env.DEEPBOOK_REFERENCE_POOL || 'DEEP_SUI';
+// The existing pool we log onto. DEEP/SUI is zero-fee (taker/maker = 0), so marker orders
+// need no DEEP -- only the SUI side and gas.
+const LOG_POOL = process.env.DEEPBOOK_LOG_POOL || 'DEEP_SUI';
 const BALANCE_MANAGER_ID = process.env.DEEPBOOK_BALANCE_MANAGER_ID || '';
 
-const coins = {
-  ...testnetCoins,
-  COMPUTE: { address: COMPUTE_PKG, type: COMPUTE_TYPE, scalar: COMPUTE_SCALAR },
-};
-const pools = {
-  ...testnetPools,
-  ...(COMPUTE_POOL_ID
-    ? { COMPUTE_SUI: { address: COMPUTE_POOL_ID, baseCoin: 'COMPUTE', quoteCoin: 'SUI' } }
-    : {}),
-};
+// Marker order shape, kept at the pool minimum so each log entry locks a negligible amount
+// and never executes (price sits far below market). DEEP/SUI: lotSize 1, minSize 10,
+// tickSize 0.00001 -- so 10 units @ 0.00001 SUI locks ~0.0001 SUI.
+const MARKER_QTY = Number(process.env.DEEPBOOK_MARKER_QTY || '10');
+const MARKER_PRICE = Number(process.env.DEEPBOOK_MARKER_PRICE || '0.00001');
+
+const coins = { ...testnetCoins };
+const pools = { ...testnetPools };
 
 function keypairFromEnv() {
   const key = process.env.SUI_PLATFORM_KEY;
@@ -57,137 +47,104 @@ function keypairFromEnv() {
   return Ed25519Keypair.fromSecretKey(key.trim());
 }
 
-function makeClient(withSigner = false) {
+function makeClient(withManager = false) {
   const client = new SuiJsonRpcClient({ url: RPC_URL });
-  const opts = { client, network: NETWORK, coins, pools };
-  if (withSigner) {
-    opts.address = keypairFromEnv().toSuiAddress();
-    if (BALANCE_MANAGER_ID) opts.balanceManagers = { MAIN: { address: BALANCE_MANAGER_ID, tradeCap: undefined } };
-  } else {
-    opts.address = '0x0';
+  const opts = { client, network: NETWORK, coins, pools, address: '0x0' };
+  if (process.env.SUI_PLATFORM_KEY) opts.address = keypairFromEnv().toSuiAddress();
+  if (withManager && BALANCE_MANAGER_ID) {
+    opts.balanceManagers = { MAIN: { address: BALANCE_MANAGER_ID } };
   }
   return new DeepBookClient(opts);
 }
 
-/**
- * Read the live order book and derive a per-compute-unit rate in SUI.
- * Returns a stable JSON shape the control plane can consume directly.
- */
-async function readPrice() {
-  const db = makeClient(false);
-  const usingOwnPool = Boolean(COMPUTE_POOL_ID);
-  const poolKey = usingOwnPool ? 'COMPUTE_SUI' : REFERENCE_POOL_KEY;
-
-  // isBid=false => asks (people selling base for quote), prices ascending from mid.
-  const asks = await db.getLevel2Range(poolKey, 0.0000001, 1_000_000, false);
-  const bids = await db.getLevel2Range(poolKey, 0.0000001, 1_000_000, true);
-  const bestAsk = asks?.prices?.length ? Number(asks.prices[0]) : null;
-  const bestBid = bids?.prices?.length ? Number(bids.prices[0]) : null;
-  const mid =
-    bestAsk != null && bestBid != null ? (bestAsk + bestBid) / 2 : bestAsk ?? bestBid;
-
-  // The rate to *buy* compute is the best ask (cheapest provider). Fall back to mid/bid so a
-  // one-sided book still yields a number.
-  const suiPerComputeUnit = bestAsk ?? mid ?? bestBid;
-
-  return {
-    ok: suiPerComputeUnit != null,
-    live: true,
-    source: usingOwnPool ? 'COMPUTE_SUI' : `reference:${REFERENCE_POOL_KEY}`,
-    poolId: usingOwnPool ? COMPUTE_POOL_ID : pools[REFERENCE_POOL_KEY]?.address ?? null,
-    poolKey,
-    bestAsk,
-    bestBid,
-    mid,
-    suiPerComputeUnit,
-    note: usingOwnPool
-      ? 'live best-ask from the marketplace COMPUTE/SUI pool'
-      : `no COMPUTE pool yet -- reading live ${REFERENCE_POOL_KEY} best-ask as a stand-in compute rate`,
-  };
+async function signAndRun(tx) {
+  const signer = keypairFromEnv();
+  const client = new SuiJsonRpcClient({ url: RPC_URL });
+  return client.signAndExecuteTransaction({
+    signer,
+    transaction: tx,
+    options: { showEffects: true, showObjectChanges: true },
+  });
 }
+
+const createdId = (res, re) =>
+  (res.objectChanges || []).find((c) => c.type === 'created' && re.test(c.objectType || ''))?.objectId ?? null;
 
 async function info() {
   return {
     rpc: RPC_URL,
     network: NETWORK,
-    computeType: COMPUTE_TYPE,
-    computeTreasury: COMPUTE_TREASURY,
-    computePoolId: COMPUTE_POOL_ID || null,
+    logPool: LOG_POOL,
+    logPoolId: pools[LOG_POOL]?.address ?? null,
     balanceManagerId: BALANCE_MANAGER_ID || null,
-    referencePool: REFERENCE_POOL_KEY,
-    referencePoolId: pools[REFERENCE_POOL_KEY]?.address ?? null,
+    markerQty: MARKER_QTY,
+    markerPrice: MARKER_PRICE,
   };
 }
 
-// ---- one-shot setup ops (write txs; need SUI_PLATFORM_KEY) -------------------------------
-
-async function signAndRun(tx) {
-  const signer = keypairFromEnv();
-  const client = new SuiJsonRpcClient({ url: RPC_URL });
-  const res = await client.signAndExecuteTransaction({
-    signer,
-    transaction: tx,
-    options: { showEffects: true, showObjectChanges: true },
-  });
-  return res;
-}
-
-/** Mint COMPUTE supply to the platform (or a given recipient). amount is whole COMPUTE. */
-async function mint(amountWhole, recipient) {
-  const signer = keypairFromEnv();
-  const to = recipient || signer.toSuiAddress();
-  const base = BigInt(Math.round(Number(amountWhole) * COMPUTE_SCALAR));
-  const tx = new Transaction();
-  tx.moveCall({
-    target: `${COMPUTE_PKG}::compute::mint`,
-    arguments: [tx.object(COMPUTE_TREASURY), tx.pure.u64(base), tx.pure.address(to)],
-  });
-  const res = await signAndRun(tx);
-  return { digest: res.digest, minted: amountWhole, recipient: to, type: COMPUTE_TYPE };
-}
-
-/** Create a shared BalanceManager (DeepBook account abstraction) owned by the platform. */
+/** One-time: create the platform's BalanceManager (DeepBook custody object). */
 async function createManager() {
-  const db = makeClient(true);
+  const db = makeClient(false);
   const tx = new Transaction();
   tx.setSenderIfNotSet(keypairFromEnv().toSuiAddress());
   db.balanceManager.createAndShareBalanceManager()(tx);
   const res = await signAndRun(tx);
-  const created = (res.objectChanges || []).find(
-    (c) => c.type === 'created' && /BalanceManager/.test(c.objectType || ''),
-  );
-  return { digest: res.digest, balanceManagerId: created?.objectId ?? null };
+  return {
+    ok: res.effects?.status?.status === 'success',
+    digest: res.digest,
+    balanceManagerId: createdId(res, /BalanceManager/),
+  };
 }
 
-/** Create the permissionless COMPUTE/SUI pool. Costs ~500 DEEP (funding-gated). */
-async function createPool() {
+/** One-time: fund the BalanceManager so marker orders have something to lock. */
+async function deposit(coinKey, amount) {
+  if (!BALANCE_MANAGER_ID) throw new Error('DEEPBOOK_BALANCE_MANAGER_ID required');
   const db = makeClient(true);
   const tx = new Transaction();
-  // base=COMPUTE, quote=SUI; conservative tick/lot/min for a play-money demo pool. The SDK
-  // pulls the 500 DEEP creation fee automatically via coinWithBalance.
-  db.deepBook.createPermissionlessPool({
-    baseCoinKey: 'COMPUTE',
-    quoteCoinKey: 'SUI',
-    tickSize: 0.0001,
-    lotSize: 0.1,
-    minSize: 1,
+  tx.setSenderIfNotSet(keypairFromEnv().toSuiAddress());
+  db.balanceManager.depositIntoManager('MAIN', coinKey, Number(amount))(tx);
+  const res = await signAndRun(tx);
+  return { ok: res.effects?.status?.status === 'success', digest: res.digest, coin: coinKey, amount: Number(amount) };
+}
+
+/**
+ * Log one settled job: place a marker order whose client-order-id carries the opaque
+ * compute-unit count. The order rests far below market (never executes); the transaction
+ * itself is the permanent on-chain record. Returns the tx digest for a Suiscan link.
+ */
+async function log(computeUnits) {
+  if (!BALANCE_MANAGER_ID) throw new Error('DEEPBOOK_BALANCE_MANAGER_ID required');
+  const units = Math.max(1, Math.floor(Number(computeUnits) || 1));
+  const db = makeClient(true);
+  const tx = new Transaction();
+  tx.setSenderIfNotSet(keypairFromEnv().toSuiAddress());
+  db.deepBook.placeLimitOrder({
+    poolKey: LOG_POOL,
+    balanceManagerKey: 'MAIN',
+    clientOrderId: String(units), // opaque compute-unit count -- no job/molecule identity
+    price: MARKER_PRICE,
+    quantity: MARKER_QTY,
+    isBid: true, // buy side: locks only the SUI quote, needs no DEEP inventory
+    payWithDeep: false, // zero-fee pool, so no DEEP needed for fees either
   })(tx);
   const res = await signAndRun(tx);
-  const created = (res.objectChanges || []).find(
-    (c) => c.type === 'created' && /::pool::Pool</.test(c.objectType || ''),
-  );
-  return { digest: res.digest, poolId: created?.objectId ?? null };
+  return {
+    ok: res.effects?.status?.status === 'success',
+    digest: res.digest,
+    pool: LOG_POOL,
+    poolId: pools[LOG_POOL]?.address ?? null,
+    computeUnits: units,
+    error: res.effects?.status?.error || null,
+  };
 }
 
 const OP = process.argv[2];
 const ARGS = process.argv.slice(3);
-
 const ops = {
   info,
-  price: readPrice,
-  mint: () => mint(ARGS[0], ARGS[1]),
   'create-manager': createManager,
-  'create-pool': createPool,
+  deposit: () => deposit(ARGS[0], ARGS[1]),
+  log: () => log(ARGS[0]),
 };
 
 const fn = ops[OP];
@@ -196,9 +153,7 @@ if (!fn) {
   process.exit(1);
 }
 fn()
-  .then((out) => {
-    console.log(JSON.stringify(out));
-  })
+  .then((out) => console.log(JSON.stringify(out)))
   .catch((err) => {
     console.log(JSON.stringify({ ok: false, error: String(err?.message || err) }));
     process.exit(1);
