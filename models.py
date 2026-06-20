@@ -258,7 +258,7 @@ def payment_intent(job_id: str) -> dict | None:
         "onchain": SUI_ONCHAIN,
     }
     if SUI_ONCHAIN:
-        info = _sui("info", {})
+        info = _chain_config()
         intent["package_id"] = info["packageId"]
         intent["module"] = info.get("module", "escrow")
         intent["arbiter"] = info["arbiter"]
