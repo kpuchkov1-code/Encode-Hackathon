@@ -13,6 +13,7 @@ step; the function signatures here are what that step will replace internally.
 """
 import json
 import os
+import secrets
 import uuid
 from datetime import datetime, timezone
 
@@ -134,22 +135,69 @@ def escrow_status(job_id: str) -> dict | None:
     return json.loads(raw) if raw is not None else None
 
 
-def register_worker(worker_id: str, hardware_info: str) -> dict:
-    """Records a hardware provider's signup. No capability-matching yet (see
-    SESSION_HANDOFF.md §8) -- any registered worker can claim any queued job."""
+HEARTBEAT_TIMEOUT_SECONDS = 15  # daemon polls every ~3s; several missed polls = offline
+
+
+def create_worker_identity() -> dict:
+    """Issues a brand-new worker_id + secret token at signup. The token must be
+    presented on every subsequent request made as this worker (registering detected
+    hardware, claiming jobs) -- this is what actually prevents two different people
+    from colliding on or impersonating the same worker_id, not just a free-text name
+    anyone could type in. Returned once, here; never echoed back afterwards."""
+    worker_id = f"worker-{uuid.uuid4().hex[:12]}"
+    token = secrets.token_urlsafe(24)
     record = {
         "worker_id": worker_id,
-        "hardware_info": hardware_info,
+        "token": token,
+        "hardware_info": "(pending -- starts once the daemon runs and detects it)",
         "registered_at": datetime.now(timezone.utc).isoformat(),
+        "last_seen": None,
     }
     _cmd("SET", WORKER_KEY.format(worker_id=worker_id), json.dumps(record))
     _cmd("SADD", WORKERS_SET_KEY, worker_id)
     return record
 
 
+def verify_worker_token(worker_id: str, token: str) -> bool:
+    record = get_worker(worker_id)
+    return record is not None and secrets.compare_digest(record.get("token", ""), token)
+
+
+def update_worker(worker_id: str, *, hardware_info: str | None = None, heartbeat: bool = False) -> None:
+    record = get_worker(worker_id)
+    if record is None:
+        return
+    if hardware_info is not None:
+        record["hardware_info"] = hardware_info
+    if heartbeat:
+        record["last_seen"] = datetime.now(timezone.utc).isoformat()
+    _cmd("SET", WORKER_KEY.format(worker_id=worker_id), json.dumps(record))
+
+
+def mark_worker_offline(worker_id: str) -> None:
+    """Called when a daemon shuts down cleanly (Ctrl+C, not a crash) so its status
+    flips to offline immediately instead of waiting out the heartbeat timeout."""
+    record = get_worker(worker_id)
+    if record is not None:
+        record["last_seen"] = None
+        _cmd("SET", WORKER_KEY.format(worker_id=worker_id), json.dumps(record))
+
+
 def get_worker(worker_id: str) -> dict | None:
+    """Returns the worker record with a computed `status` (online/offline) based on
+    HEARTBEAT_TIMEOUT_SECONDS -- never trust a stored status, always compute it fresh
+    from `last_seen` so a crashed (not cleanly shut down) daemon still ages out."""
     raw = _cmd("GET", WORKER_KEY.format(worker_id=worker_id))
-    return json.loads(raw) if raw is not None else None
+    if raw is None:
+        return None
+    record = json.loads(raw)
+    last_seen = record.get("last_seen")
+    if last_seen is None:
+        record["status"] = "offline"
+    else:
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(last_seen)).total_seconds()
+        record["status"] = "online" if age < HEARTBEAT_TIMEOUT_SECONDS else "offline"
+    return record
 
 
 def list_workers() -> list[str]:

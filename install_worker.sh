@@ -7,9 +7,11 @@
 # system Python or packages. Uses AutoDock Vina for now (see SESSION_HANDOFF.md) -- the
 # heavier gnina engine is a planned future option, not available out of the box yet.
 #
-# Usage:
-#   CONTROL_PLANE_URL=https://your-deployment.vercel.app WORKER_ID=my-machine \
-#       ./install_worker.sh
+# Usage (worker_id and token come from signing up at {control plane}/providers/signup --
+# the server issues them, you don't make them up, so two providers can never collide on
+# or impersonate the same identity):
+#   CONTROL_PLANE_URL=https://your-deployment.vercel.app WORKER_ID=worker-xxxx \
+#       WORKER_TOKEN=... ./install_worker.sh
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,7 +27,8 @@ if ! command -v python3 &>/dev/null; then
 fi
 
 : "${CONTROL_PLANE_URL:?Set CONTROL_PLANE_URL to the deployed control plane URL, e.g. https://your-deployment.vercel.app}"
-export WORKER_ID="${WORKER_ID:-$(hostname)-docker}"
+: "${WORKER_ID:?Sign up at \$CONTROL_PLANE_URL/providers/signup to get a WORKER_ID}"
+: "${WORKER_TOKEN:?Sign up at \$CONTROL_PLANE_URL/providers/signup to get a WORKER_TOKEN}"
 
 if ! python3 -c "import requests" 2>/dev/null; then
   echo "Installing the orchestrator's one dependency (requests)..."

@@ -12,16 +12,20 @@ address on the worker's machine.
 Hand-written (Codeplain dropped, see SESSION_HANDOFF.md).
 
 Usage:
-    CONTROL_PLANE_URL=https://your-deployment.vercel.app WORKER_ID=node-1 \
-        python worker_daemon.py
+    CONTROL_PLANE_URL=https://your-deployment.vercel.app WORKER_ID=worker-xxxx \
+        WORKER_TOKEN=... python worker_daemon.py
+(WORKER_ID and WORKER_TOKEN come from signing up at {control plane}/providers/signup --
+they're issued by the server, not chosen here, so two daemons can never collide on or
+impersonate the same identity.)
 """
 import json
 import logging
 import os
 import platform
 import shutil
-import socket
+import signal
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -31,7 +35,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("worker_daemon")
 
 CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://localhost:8000")
-WORKER_ID = os.environ.get("WORKER_ID", socket.gethostname())
+WORKER_ID = os.environ.get("WORKER_ID")
+WORKER_TOKEN = os.environ.get("WORKER_TOKEN")
 POLL_INTERVAL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "3"))
 # Vina is the working engine for now (see SESSION_HANDOFF.md) -- gnina's image needs a
 # pre-downloaded binary that isn't in the git repo (gitignored, ~1.4GB) and hasn't had a
@@ -78,12 +83,26 @@ def register_self(hardware_info: str) -> None:
     try:
         requests.post(
             f"{CONTROL_PLANE_URL}/workers/register",
-            json={"worker_id": WORKER_ID, "hardware_info": hardware_info},
+            json={"worker_id": WORKER_ID, "token": WORKER_TOKEN, "hardware_info": hardware_info},
             timeout=10,
         ).raise_for_status()
         log.info("registered with control plane: %s", hardware_info)
     except requests.RequestException:
         log.exception("could not register with control plane (continuing anyway)")
+
+
+def mark_offline() -> None:
+    """Called on clean shutdown (Ctrl+C) so the control plane reflects this worker
+    going offline immediately, instead of waiting out the heartbeat timeout."""
+    try:
+        requests.post(
+            f"{CONTROL_PLANE_URL}/workers/{WORKER_ID}/offline",
+            json={"worker_id": WORKER_ID, "token": WORKER_TOKEN},
+            timeout=5,
+        )
+        log.info("reported offline to control plane")
+    except requests.RequestException:
+        log.exception("could not report offline (control plane may show this worker as online briefly)")
 
 
 def ensure_engine_image_built() -> None:
@@ -96,7 +115,11 @@ def ensure_engine_image_built() -> None:
 
 
 def claim_one_job() -> dict | None:
-    resp = requests.post(f"{CONTROL_PLANE_URL}/jobs/claim", json={"worker_id": WORKER_ID}, timeout=10)
+    resp = requests.post(
+        f"{CONTROL_PLANE_URL}/jobs/claim",
+        json={"worker_id": WORKER_ID, "token": WORKER_TOKEN},
+        timeout=10,
+    )
     resp.raise_for_status()
     return resp.json()["job"]
 
@@ -143,8 +166,25 @@ def run_one_job(job_id: str, job_spec: dict, gpu_available: bool) -> None:
 
 
 def main() -> None:
+    if not WORKER_ID or not WORKER_TOKEN:
+        log.error(
+            "WORKER_ID and WORKER_TOKEN are both required (sign up at "
+            "%s/providers/signup to get them -- they're issued by the server, not "
+            "something you make up, so identities can't collide or be impersonated)",
+            CONTROL_PLANE_URL,
+        )
+        sys.exit(1)
+
     log.info("worker daemon starting: id=%s control_plane=%s", WORKER_ID, CONTROL_PLANE_URL)
     subprocess.run(["docker", "--version"], check=True, capture_output=True)  # fail fast if Docker missing
+
+    def _on_shutdown_signal(signum, frame) -> None:  # noqa: ANN001 -- signal handler signature
+        log.info("shutting down (signal %s), reporting offline...", signum)
+        mark_offline()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, _on_shutdown_signal)
+    signal.signal(signal.SIGTERM, _on_shutdown_signal)
 
     gpu_available = has_gpu_passthrough_available()
     log.info("GPU passthrough available: %s", gpu_available)

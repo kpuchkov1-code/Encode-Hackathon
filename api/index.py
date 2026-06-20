@@ -11,7 +11,6 @@ Hand-written (Codeplain dropped, see SESSION_HANDOFF.md).
 """
 import os
 import sys
-import uuid
 from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -106,13 +105,23 @@ def submit_job(job_spec: JobSpec) -> dict:
     return created
 
 
-class ClaimRequest(BaseModel):
+class WorkerAuth(BaseModel):
     worker_id: str
+    token: str
+
+
+def _require_worker_token(auth: WorkerAuth) -> None:
+    if not models.verify_worker_token(auth.worker_id, auth.token):
+        raise HTTPException(status_code=401, detail="unknown worker_id or invalid token")
 
 
 @app.post("/jobs/claim")
-def claim_job(claim: ClaimRequest) -> dict:
-    """Polled by worker daemons (never pushed to -- they may be behind NAT)."""
+def claim_job(claim: WorkerAuth) -> dict:
+    """Polled by worker daemons (never pushed to -- they may be behind NAT). Requires
+    the token issued at signup so a job can only be claimed by a daemon that actually
+    proved it owns this worker_id -- not just anyone who guesses or types the name."""
+    _require_worker_token(claim)
+    models.update_worker(claim.worker_id, heartbeat=True)  # polling itself is the heartbeat
     job = models.claim_next_job(claim.worker_id)
     if job is None:
         return {"job": None}
@@ -167,17 +176,27 @@ def worker_callback(job_id: str, callback: WorkerCallback) -> dict:
     return {"ok": True}
 
 
-class WorkerRegistration(BaseModel):
-    worker_id: str
+class WorkerRegistration(WorkerAuth):
     hardware_info: str = ""
 
 
 @app.post("/workers/register")
 def register_worker(registration: WorkerRegistration) -> dict:
-    """Hardware providers register before running the daemon. No capability-matching
-    yet (see SESSION_HANDOFF.md §8) -- registration is bookkeeping only for now; any
-    worker_id can claim any job regardless of whether it's registered."""
-    return models.register_worker(registration.worker_id, registration.hardware_info)
+    """Called by the daemon itself on startup to report detected hardware -- requires
+    the token issued at signup, so only the legitimate owner of a worker_id can update
+    it (prevents impersonation/collision on a guessed or typed-in worker_id)."""
+    _require_worker_token(registration)
+    models.update_worker(registration.worker_id, hardware_info=registration.hardware_info, heartbeat=True)
+    return {"ok": True}
+
+
+@app.post("/workers/{worker_id}/offline")
+def worker_offline(worker_id: str, auth: WorkerAuth) -> dict:
+    """Called by the daemon on clean shutdown (Ctrl+C) so its status flips to offline
+    immediately instead of waiting out the heartbeat timeout."""
+    _require_worker_token(auth)
+    models.mark_worker_offline(worker_id)
+    return {"ok": True}
 
 
 # --- Minimal, unstyled HTML so both sides of the marketplace can be exercised by hand
@@ -185,25 +204,28 @@ def register_worker(registration: WorkerRegistration) -> dict:
 
 @app.get("/providers/signup", response_class=HTMLResponse)
 def providers_signup_form() -> str:
-    suggested_id = f"worker-{uuid.uuid4().hex[:8]}"
-    return f"""
+    return """
     <h1>Provide idle compute</h1>
     <p>Hardware is detected automatically by the daemon when it starts (CPU cores,
-    GPU if present) -- you don't need to describe it yourself.</p>
+    GPU if present) -- you don't need to describe it yourself. Your worker ID and
+    access token are generated for you, not typed in, so no two providers can ever
+    collide on or impersonate the same identity.</p>
     <form method="post" action="/providers/signup">
-      <label>Worker ID: <input name="worker_id" value="{suggested_id}" required></label><br>
       <button type="submit">Sign up</button>
     </form>
     """
 
 
 @app.post("/providers/signup", response_class=HTMLResponse)
-def providers_signup_submit(request: Request, worker_id: str = Form(...)) -> str:
-    models.register_worker(worker_id, "(pending -- starts once the daemon runs and detects it)")
+def providers_signup_submit(request: Request) -> str:
+    identity = models.create_worker_identity()
+    worker_id, token = identity["worker_id"], identity["token"]
     base_url = str(request.base_url).rstrip("/")
-    run_cmd = f"CONTROL_PLANE_URL={base_url} WORKER_ID={worker_id} ./install_worker.sh"
+    run_cmd = f"CONTROL_PLANE_URL={base_url} WORKER_ID={worker_id} WORKER_TOKEN={token} ./install_worker.sh"
     return f"""
     <h1>Signed up: {worker_id}</h1>
+    <p><strong>Save this command somewhere -- the token in it is only shown once and
+    cannot be recovered if lost (you'd need to sign up again for a new identity).</strong></p>
     <p>Follow these steps on the computer that will actually provide compute (it can be
     a different machine than the one you're signing up from). You do not need a GitHub
     account or any access to our source code -- just this one setup package.</p>
@@ -220,9 +242,9 @@ unzip worker-package.zip -d worker-package
 cd worker-package
 chmod +x install_worker.sh</pre>
       </li>
-      <li>Run this exact command (already has your worker ID and this server's address
-        filled in) and leave the terminal window open -- the daemon only receives jobs
-        while it's running:
+      <li>Run this exact command (already has your worker ID, secret token, and this
+        server's address filled in) and leave the terminal window open -- the daemon
+        only receives jobs while it's running:
         <pre>{run_cmd}</pre>
         The first run also builds a small (~300MB) Docker image -- this only happens
         once. After that, nothing else gets installed on your machine; the docking
@@ -233,10 +255,12 @@ chmod +x install_worker.sh</pre>
         <code>registered with control plane: 8 CPU cores, Linux, x86_64</code>
         (your actual hardware), then <code>polling for jobs...</code>. You can also
         check <a href="{base_url}/workers/{worker_id}">{base_url}/workers/{worker_id}</a>
-        in a browser to see what hardware was detected.
+        in a browser to see what hardware was detected and whether it's currently
+        online (it goes offline automatically if you stop the daemon).
       </li>
       <li>That's it -- leave it running. When a researcher submits a job, your machine
-        may be assigned to run it automatically.</li>
+        may be assigned to run it automatically. Stop providing compute any time with
+        Ctrl+C in that terminal -- the daemon reports itself offline immediately.</li>
     </ol>
     """
 
@@ -246,6 +270,7 @@ def get_worker(worker_id: str) -> dict:
     worker = models.get_worker(worker_id)
     if worker is None:
         raise HTTPException(status_code=404)
+    worker.pop("token", None)  # never expose the secret token over a public read
     return worker
 
 
