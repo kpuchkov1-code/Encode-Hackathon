@@ -27,6 +27,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 import requests
@@ -103,6 +104,25 @@ def mark_offline() -> None:
         log.info("reported offline to control plane")
     except requests.RequestException:
         log.exception("could not report offline (control plane may show this worker as online briefly)")
+
+
+HEARTBEAT_INTERVAL_SECONDS = 5  # well under the server's 15s offline timeout
+
+
+def heartbeat_loop(stop_event: threading.Event) -> None:
+    """Runs in its own thread so heartbeats keep going even while the main thread is
+    blocked inside subprocess.run() for the whole duration of a docking job -- jobs can
+    easily run longer than the heartbeat timeout, and without this the daemon would
+    falsely show as offline on the dashboard while it's actively working."""
+    while not stop_event.wait(HEARTBEAT_INTERVAL_SECONDS):
+        try:
+            requests.post(
+                f"{CONTROL_PLANE_URL}/workers/{WORKER_ID}/heartbeat",
+                json={"worker_id": WORKER_ID, "token": WORKER_TOKEN},
+                timeout=5,
+            )
+        except requests.RequestException:
+            log.debug("heartbeat ping failed (will retry)", exc_info=True)
 
 
 def ensure_engine_image_built() -> None:
@@ -190,6 +210,9 @@ def main() -> None:
     log.info("GPU passthrough available: %s", gpu_available)
 
     register_self(detect_hardware(gpu_available))
+
+    heartbeat_stop = threading.Event()
+    threading.Thread(target=heartbeat_loop, args=(heartbeat_stop,), daemon=True).start()
 
     ensure_engine_image_built()
     log.info("engine image ready, polling for jobs...")

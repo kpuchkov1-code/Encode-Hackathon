@@ -22,13 +22,15 @@ import requests
 KV_REST_API_URL = os.environ["KV_REST_API_URL"]
 KV_REST_API_TOKEN = os.environ["KV_REST_API_TOKEN"]
 
-VALID_STATES = {"queued", "running", "docked", "proven", "settled", "failed"}
+VALID_STATES = {"pending_payment", "queued", "running", "docked", "proven", "settled", "failed"}
 
 JOB_KEY = "job:{job_id}"
 ESCROW_KEY = "escrow:{job_id}"
 QUEUE_KEY = "queued_jobs"
 WORKER_KEY = "worker:{worker_id}"
 WORKERS_SET_KEY = "registered_workers"
+RESEARCHER_KEY = "researcher:{researcher_id}"
+RESEARCHERS_SET_KEY = "registered_researchers"
 
 
 def _cmd(*args) -> object:
@@ -46,20 +48,39 @@ def init_db() -> None:
     pass  # Upstash needs no schema setup; kept for call-site compatibility.
 
 
-def create_job(job_spec: dict) -> dict:
+def create_job(job_spec: dict, *, price: float, researcher_id: str) -> dict:
+    """Creates a job in `pending_payment` -- NOT queued for execution yet. A job only
+    becomes visible to worker daemons once confirm_job() is called (after the
+    researcher has seen the price estimate and explicitly agreed to it)."""
     job_id = str(uuid.uuid4())
     record = {
         "job_id": job_id,
         "spec": job_spec,
-        "state": "queued",
+        "state": "pending_payment",
         "reason": "",
         "result": None,
         "claimed_by": None,
+        "price": price,
+        "researcher_id": researcher_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     _cmd("SET", JOB_KEY.format(job_id=job_id), json.dumps(record))
+    return {"job_id": job_id, "state": "pending_payment", "price": price}
+
+
+def confirm_job(job_id: str) -> dict | None:
+    """Researcher has agreed to the price -- hold escrow and actually enqueue the job
+    for a worker daemon to claim. Returns None if the job doesn't exist or isn't
+    awaiting payment (e.g. already confirmed, or expired/failed)."""
+    record = get_job(job_id)
+    if record is None or record["state"] != "pending_payment":
+        return None
+    record["state"] = "queued"
+    _put_job(record)
     _cmd("RPUSH", QUEUE_KEY, job_id)
-    return {"job_id": job_id, "state": "queued"}
+    escrow_hold(job_id, record["price"], record["spec"]["payment"]["supplier_id"])
+    increment_researcher_stats(record["researcher_id"], submitted=True, spent=record["price"])
+    return record
 
 
 def get_job(job_id: str) -> dict | None:
@@ -202,3 +223,48 @@ def get_worker(worker_id: str) -> dict | None:
 
 def list_workers() -> list[str]:
     return _cmd("SMEMBERS", WORKERS_SET_KEY) or []
+
+
+def increment_worker_stats(worker_id: str, *, completed: bool = False, earned: float = 0) -> None:
+    """`earned` is a proxy (price of jobs this worker has docked), not real settled
+    payment -- there's no real escrow release/blockchain payout yet (see
+    SESSION_HANDOFF.md §8). Labelled as such wherever it's displayed."""
+    record = get_worker(worker_id)
+    if record is None:
+        return
+    record.pop("status", None)  # computed field from get_worker, don't persist it
+    record["jobs_completed"] = record.get("jobs_completed", 0) + (1 if completed else 0)
+    record["total_earned"] = record.get("total_earned", 0) + earned
+    _cmd("SET", WORKER_KEY.format(worker_id=worker_id), json.dumps(record))
+
+
+def create_researcher_identity(email: str) -> dict:
+    researcher_id = f"researcher-{uuid.uuid4().hex[:12]}"
+    record = {
+        "researcher_id": researcher_id,
+        "email": email,
+        "registered_at": datetime.now(timezone.utc).isoformat(),
+        "jobs_submitted": 0,
+        "total_spent": 0,
+    }
+    _cmd("SET", RESEARCHER_KEY.format(researcher_id=researcher_id), json.dumps(record))
+    _cmd("SADD", RESEARCHERS_SET_KEY, researcher_id)
+    return record
+
+
+def get_researcher(researcher_id: str) -> dict | None:
+    raw = _cmd("GET", RESEARCHER_KEY.format(researcher_id=researcher_id))
+    return json.loads(raw) if raw is not None else None
+
+
+def increment_researcher_stats(researcher_id: str, *, submitted: bool = False, spent: float = 0) -> None:
+    record = get_researcher(researcher_id)
+    if record is None:
+        return
+    record["jobs_submitted"] = record.get("jobs_submitted", 0) + (1 if submitted else 0)
+    record["total_spent"] = record.get("total_spent", 0) + spent
+    _cmd("SET", RESEARCHER_KEY.format(researcher_id=researcher_id), json.dumps(record))
+
+
+def list_researchers() -> list[str]:
+    return _cmd("SMEMBERS", RESEARCHERS_SET_KEY) or []
