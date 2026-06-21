@@ -426,12 +426,70 @@ def claim_job(claim: WorkerAuth) -> dict:
     return {"job": {"job_id": job["job_id"], "job_spec": job["spec"]}}
 
 
+# ---------------------------------------------------------------------------------------
+# Frontend (SPA) compatibility API
+# ---------------------------------------------------------------------------------------
+# The Next.js frontend in web/ codes to API_CONTRACT.md, which models a simpler 6-state
+# lifecycle than the real backend (which adds pending_payment / verifying / disputed for
+# the on-chain escrow + independent-verification machinery). These helpers + endpoints
+# present the real job/escrow/result/proof data in exactly the shapes the SPA expects, so
+# the frontend's proxy (web/app/api/[...path]/route.ts -> BACKEND_BASE_URL) can talk to
+# this backend unchanged. Internal consumers (the worker daemon, the server-rendered HTML
+# pages) read models.* directly and are unaffected by these projections.
+
+# Map the real internal state to the contract's lifecycle. `verifying` still has results
+# available (the primary dock finished), so it presents as `docked`; `disputed` is a
+# verification failure that refunds, so it presents as `failed`. `pending_payment` is
+# passed through -- the SPA's submit flow handles it explicitly (wallet lock step).
+_FE_STATE_MAP = {
+    "pending_payment": "pending_payment",
+    "queued": "queued",
+    "running": "running",
+    "docked": "docked",
+    "verifying": "docked",
+    "proven": "proven",
+    "settled": "settled",
+    "disputed": "failed",
+    "failed": "failed",
+}
+
+
+def _fe_state(state: str) -> str:
+    return _FE_STATE_MAP.get(state, state)
+
+
+@app.get("/jobs")
+def list_jobs() -> dict:
+    """List endpoint the SPA's provider dashboard polls to compute the job feed + earnings.
+    Returns only primary jobs (internal verification re-runs are an implementation detail)
+    newest first, in the contract's {jobs:[{job_id, state, created_at}]} shape."""
+    jobs = [j for j in models.list_all_jobs() if j.get("kind", "primary") != "verification"]
+    jobs.sort(key=lambda j: j.get("created_at") or "", reverse=True)
+    return {
+        "jobs": [
+            {
+                "job_id": j["job_id"],
+                "state": _fe_state(j["state"]),
+                "created_at": j.get("created_at") or "",
+                "price": j.get("price"),
+                "supplier_id": (j.get("spec", {}).get("payment", {}) or {}).get("supplier_id", "any"),
+            }
+            for j in jobs
+        ]
+    }
+
+
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str) -> dict:
     job = models.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404)
-    return {"job_id": job["job_id"], "state": job["state"], "reason": job["reason"], "price": job.get("price")}
+    return {
+        "job_id": job["job_id"],
+        "state": _fe_state(job["state"]),
+        "reason": job["reason"],
+        "price": job.get("price"),
+    }
 
 
 @app.get("/jobs/{job_id}/escrow")
@@ -445,13 +503,105 @@ def get_escrow(job_id: str) -> dict:
 
 
 @app.get("/jobs/{job_id}/result")
-def get_result(job_id: str) -> list:
+def get_result(job_id: str) -> dict:
+    """Docking results in the SPA contract's DockResult shape. The Vina engine produces a
+    `vina_affinity` (kcal/mol, more negative = better) and a docked pose, but no gnina CNN
+    scores -- those fields are surfaced as null so the frontend can show a dash rather than
+    a fake number. Ranked best-first by vina_affinity. Errored ligands are omitted from the
+    ranked list (the per-ligand error is still in the raw record / download zip)."""
     job = models.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404)
     if job["state"] not in RESULT_READY_STATES:
-        raise HTTPException(status_code=409, detail=f"job is in state {job['state']}, not yet docked")
-    return job["result"]
+        raise HTTPException(status_code=409, detail=f"result not ready (state={job['state']})")
+    rows = [r for r in (job.get("result") or []) if "error" not in r]
+    rows.sort(key=lambda r: r.get("vina_affinity", 0.0))  # more negative kcal/mol = better
+    return {
+        "job_id": job_id,
+        "ligands": [
+            {
+                "ligand_id": r["ligand_id"],
+                "cnn_score": None,
+                "cnn_affinity": None,
+                "vina_affinity": r.get("vina_affinity"),
+                "pose_path": f"poses/{r['ligand_id']}.pdbqt",
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.get("/jobs/{job_id}/proof")
+def get_proof(job_id: str) -> dict:
+    """Proof-of-execution in the SPA contract's Proof shape. Built from the SAME canonical
+    hashes the platform anchors to Walrus (walrus.build_manifest), so the manifest hash the
+    UI shows is the real tamper-evidence token -- not a decorative one. Available once the
+    job is proven/settled."""
+    import hashlib
+
+    job = models.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404)
+    if job["state"] not in ("proven", "settled"):
+        raise HTTPException(status_code=409, detail=f"proof not ready (state={job['state']})")
+
+    spec = job.get("spec", {})
+    params = spec.get("params", {}) or {}
+    results = [r for r in (job.get("result") or []) if "error" not in r]
+    seed = params.get("seed", 0)
+    manifest = walrus.build_manifest(job_id, seed, "vina", results)  # positional result hashes
+    ligand_sha256s = {
+        r["ligand_id"]: manifest["ligands"][i]["result_sha256"]
+        for i, r in enumerate(results)
+        if i < len(manifest.get("ligands", []))
+    }
+    pose_sha256s = {
+        r["ligand_id"]: hashlib.sha256((r.get("pose_pdbqt") or "").encode("utf-8")).hexdigest()
+        for r in results
+        if r.get("pose_pdbqt")
+    }
+    receptor_text = (spec.get("receptor", {}) or {}).get("file") or (spec.get("receptor", {}) or {}).get("pdb_id", "")
+    walrus_rec = job.get("walrus") or {}
+    return {
+        "manifest_sha256": manifest.get("bundle_sha256", ""),
+        "receptor_sha256": hashlib.sha256(receptor_text.encode("utf-8")).hexdigest(),
+        "ligand_sha256s": ligand_sha256s,
+        "pose_sha256s": pose_sha256s,
+        "params": {
+            "exhaustiveness": params.get("exhaustiveness"),
+            "num_modes": params.get("num_modes"),
+            "cnn": params.get("cnn") or "none",
+            "seed": seed,
+        },
+        "gnina_version": "AutoDock Vina 1.2.5",
+        "timestamp": job.get("started_at") or job.get("created_at") or "",
+        "worker_id": job.get("claimed_by") or "",
+        "storage_blob_id": walrus_rec.get("blob_id") or "",
+    }
+
+
+class RunRequest(BaseModel):
+    supplier_id: str = "any"
+
+
+@app.post("/jobs/{job_id}/run", status_code=202)
+def run_job(job_id: str, body: RunRequest) -> dict:
+    """Supply-side 'Run' action from the SPA provider dashboard: attribute a queued job to
+    a supplier so its escrow/earnings reflect the claim. NOTE: real docking is performed by
+    the pull-based worker daemon (POST /jobs/claim), not triggered here -- this endpoint
+    records the supplier attribution and reports the job as running; the daemon does the
+    actual compute. Returns 409 if the job isn't claimable."""
+    job = models.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    if job["state"] != "queued":
+        raise HTTPException(status_code=409, detail=f"job not claimable (state={job['state']})")
+    worker_id = body.supplier_id or "any"
+    # Record the supplier attribution; the pull-based daemon performs the actual dock and
+    # will flip the state to running on its next claim. We report the real current state so
+    # the UI reflects truth (it advances to running once a daemon picks the job up).
+    models.update_job_extra(job_id, supplier_id=worker_id)
+    return {"job_id": job_id, "state": _fe_state(job["state"]), "worker_id": worker_id}
 
 
 @app.get("/jobs/{job_id}/download")
