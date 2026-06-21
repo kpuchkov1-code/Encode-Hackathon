@@ -59,7 +59,8 @@ export interface JobParams {
 }
 
 export interface Payment {
-  amount: number;
+  /** Optional and ignored by the backend — price is always server-computed (see estimate). */
+  amount?: number;
   supplier_id: string;
 }
 

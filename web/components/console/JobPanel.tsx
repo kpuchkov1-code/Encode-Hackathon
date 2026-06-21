@@ -1,27 +1,31 @@
 "use client";
 
 /*
-  Hybrid submit panel. The chat fills it (ligands, pocket, payment); the user reviews,
-  edits, and clicks Run — the ONLY action that calls POST /jobs. Once a job exists, the
-  lifecycle cards (stepper / escrow / results / proof) render inline below, driven by the
-  same SWR polling hooks the old status page used.
+  Docking job panel — the buyer-side submit surface, now living in the console's LEFT pane.
+  The chat fills the draft (ligands + pocket via client tools); the user reviews, edits, and
+  clicks "Run job" — the ONLY action that calls POST /jobs. Once a job exists, the lifecycle
+  cards (stepper / escrow / results / proof) render inline below, driven by the same SWR
+  polling hooks the status page uses.
 
-  Buyer-side functionality wired here:
-   - editable ligand library (add / edit / remove, plus uploaded SMILES/SDF via FilesPanel)
-   - compute-provider selection with a live credit quote (the two-sided marketplace)
-   - docking-parameter controls (exhaustiveness, modes) the backend already accepts
+  Backend alignment (see api/index.py):
+   - Ligands are SDF only. The control plane is dependency-light (no RDKit), so it cannot
+     embed 3D coordinates from a SMILES string — `_ligands_to_sdf` 400s on a SMILES-only
+     ligand. The editor therefore accepts uploaded .sdf/.mol files exclusively.
+   - There is no payment input. Price is ALWAYS server-computed (POST /jobs/estimate, then
+     locked at the pay step); the panel shows that quote read-only.
+   - There is no provider picker. `payment.supplier_id` is "any"; the control plane assigns
+     each job FIFO to whichever registered worker daemon claims it.
 */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useCurrentAccount } from "@mysten/dapp-kit";
 import { useJobDraft } from "@/lib/jobStore";
 import { useStructure } from "@/lib/structureStore";
-import { createJob, ApiError } from "@/lib/api";
+import { createJob, estimateJob, ApiError, type JobEstimate } from "@/lib/api";
 import { useJob, useEscrow, useResult, useProof } from "@/lib/hooks";
 import { stateReached } from "@/lib/types";
-import { PROVIDERS, providerById, quoteCredits, etaSeconds } from "@/lib/providers";
-import { ligandPreview } from "@/lib/ligands";
+import { ligandPreview, parseSdf } from "@/lib/ligands";
 import { PipelineStepper } from "../PipelineStepper";
 import { EscrowPanel } from "../EscrowPanel";
 import { ResultsTable } from "../ResultsTable";
@@ -43,39 +47,23 @@ export function JobPanel() {
   }, []);
 
   const { draft, jobId } = job;
-  const hasDraft = draft.ligands.length > 0 || draft.pocket !== null;
-  // Show the submit surface as soon as a receptor is loaded (not only once ligands exist),
-  // so there's always a visible "Run screen" button — you add ligands right here.
-  if (!hasDraft && !jobId && !receptorText) return null;
-
-  const provider = providerById(draft.supplierId) ?? PROVIDERS[0];
-  const ligandCount = Math.max(1, draft.ligands.length);
-  const quote = quoteCredits(provider, ligandCount, draft.params.exhaustiveness);
-  const eta = etaSeconds(provider, ligandCount);
-
-  function selectProvider(id: string) {
-    const p = providerById(id) ?? PROVIDERS[0];
-    job.setSupplier(p.id);
-    // Re-price to the new provider's quote (user can still override the amount).
-    job.setAmount(quoteCredits(p, Math.max(1, draft.ligands.length), draft.params.exhaustiveness));
-  }
 
   async function run() {
     setErr(null);
     if (draft.ligands.length === 0) {
-      setErr("add at least one ligand before running");
+      setErr("upload at least one ligand SDF before running");
       return;
     }
-    if (draft.ligands.some((l) => !l.smiles && !l.sdf)) {
-      setErr("every ligand needs a SMILES string (or an SDF)");
+    if (draft.ligands.some((l) => !l.sdf)) {
+      setErr("every ligand must be an SDF — remove SMILES-only entries and upload an .sdf");
       return;
     }
     setRunning(true);
     try {
       const spec = { ...job.buildSpec(receptor), researcher: account?.address };
       const res = await createJob(spec);
-      // On-chain, the job starts in `pending_payment` and needs the wallet lock step before
-      // it can queue -- hand off to the pay page (carrying the receptor PDB for rendering).
+      // The backend creates the job in `pending_payment`; the pay page runs confirm ->
+      // (off-chain: queue) or (on-chain: wallet lock) and shows the real backend price.
       if (res.state === "pending_payment") {
         const q = pdbId ? `?pdb=${encodeURIComponent(pdbId)}` : "";
         router.push(`/jobs/${res.job_id}/pay${q}`);
@@ -91,176 +79,219 @@ export function JobPanel() {
   }
 
   return (
-    <div className="rounded-2xl border border-accent/30 bg-surface">
-      <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
-        <span className="font-mono text-[11px] uppercase tracking-wider text-accent-bright">
-          Docking job
-        </span>
-        {jobId && (
-          <span className="font-mono text-[10px] text-muted">{jobId.slice(0, 12)}…</span>
+    <div className="flex h-full flex-col">
+      <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
+        {jobId ? (
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <span className="font-mono text-[10px] uppercase tracking-wider text-accent-bright">
+                Active job
+              </span>
+              <span className="font-mono text-[10px] text-muted">{jobId.slice(0, 12)}…</span>
+            </div>
+            <Lifecycle jobId={jobId} />
+            <button
+              type="button"
+              onClick={() => {
+                job.setJobId(null);
+                window.history.replaceState({}, "", window.location.pathname);
+              }}
+              className="w-full rounded-lg border border-border bg-surface-2 py-2 font-mono text-[11px] text-muted transition-colors hover:border-accent/50 hover:text-foreground"
+            >
+              + new job
+            </button>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            <Field label="Receptor">
+              <span className="font-mono text-sm text-foreground">
+                {uploaded ? (
+                  <>
+                    <span className="text-select-bright">uploaded</span>
+                    <span className="ml-1.5 text-muted">{source}</span>
+                  </>
+                ) : receptorText ? (
+                  pdbId || "—"
+                ) : (
+                  <span className="text-muted">load a structure on the right</span>
+                )}
+              </span>
+            </Field>
+
+            <Field label="Ligands">
+              <LigandEditor />
+            </Field>
+
+            <Field label="Pocket">
+              <span className="font-mono text-sm text-select-bright">
+                {draft.pocket ? draft.pocket.label : "auto (select residues to refine)"}
+              </span>
+            </Field>
+
+            <Field label="Params">
+              <div className="flex flex-1 items-center gap-3">
+                <NumField
+                  label="exh"
+                  value={draft.params.exhaustiveness}
+                  min={1}
+                  max={64}
+                  onChange={(v) => job.setParams({ exhaustiveness: v })}
+                />
+                <NumField
+                  label="modes"
+                  value={draft.params.num_modes}
+                  min={1}
+                  max={20}
+                  onChange={(v) => job.setParams({ num_modes: v })}
+                />
+              </div>
+            </Field>
+
+            <Field label="Price">
+              <PriceQuote />
+            </Field>
+
+            {err && <p className="font-mono text-[11px] text-amber-300">{err}</p>}
+
+            <button
+              type="button"
+              onClick={run}
+              disabled={running || draft.ligands.length === 0}
+              className="w-full rounded-lg bg-accent py-2 text-sm font-medium text-white transition-colors hover:bg-accent-bright disabled:opacity-50"
+            >
+              {running ? "submitting…" : "Run job ▶"}
+            </button>
+          </div>
         )}
       </div>
-
-      {!jobId && (
-        <div className="space-y-3 px-4 py-3">
-          <Field label="Receptor">
-            <span className="font-mono text-sm text-foreground">
-              {uploaded ? (
-                <>
-                  <span className="text-select-bright">uploaded</span>
-                  <span className="ml-1.5 text-muted">{source}</span>
-                </>
-              ) : (
-                pdbId || "—"
-              )}
-            </span>
-          </Field>
-
-          <Field label="Ligands">
-            <LigandEditor />
-          </Field>
-
-          <Field label="Pocket">
-            <span className="font-mono text-sm text-select-bright">
-              {draft.pocket ? draft.pocket.label : "auto (select residues to refine)"}
-            </span>
-          </Field>
-
-          <Field label="Provider">
-            <div className="flex-1 space-y-1.5">
-              <select
-                value={provider.id}
-                onChange={(e) => selectProvider(e.target.value)}
-                className="w-full rounded-md border border-border bg-surface-2 px-2 py-1.5 font-mono text-xs text-foreground outline-none focus:border-accent"
-              >
-                {PROVIDERS.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name} · {p.gpu} · {p.region}
-                  </option>
-                ))}
-              </select>
-              <p className="font-mono text-[10px] text-muted">
-                ~{eta}s · quote{" "}
-                <span className="text-foreground">{quote}</span> credits
-              </p>
-            </div>
-          </Field>
-
-          <Field label="Params">
-            <div className="flex flex-1 items-center gap-3">
-              <NumField
-                label="exh"
-                value={draft.params.exhaustiveness}
-                min={1}
-                max={64}
-                onChange={(v) => job.setParams({ exhaustiveness: v })}
-              />
-              <NumField
-                label="modes"
-                value={draft.params.num_modes}
-                min={1}
-                max={20}
-                onChange={(v) => job.setParams({ num_modes: v })}
-              />
-            </div>
-          </Field>
-
-          <Field label="Payment">
-            <div className="flex items-center gap-2">
-              <input
-                type="number"
-                value={draft.amount}
-                onChange={(e) => job.setAmount(Number(e.target.value))}
-                className="w-20 rounded-md border border-border bg-surface-2 px-2 py-1 font-mono text-sm text-foreground outline-none focus:border-accent"
-              />
-              <span className="font-mono text-xs text-muted">credits</span>
-              {draft.amount !== quote && (
-                <button
-                  type="button"
-                  onClick={() => job.setAmount(quote)}
-                  className="rounded-md border border-border bg-surface-2 px-2 py-1 font-mono text-[10px] text-muted hover:text-foreground"
-                  title="Use the provider quote"
-                >
-                  use quote {quote}
-                </button>
-              )}
-            </div>
-          </Field>
-
-          {err && <p className="font-mono text-[11px] text-amber-300">{err}</p>}
-
-          <button
-            type="button"
-            onClick={run}
-            disabled={running}
-            className="w-full rounded-lg bg-accent py-2 text-sm font-medium text-white transition-colors hover:bg-accent-bright disabled:opacity-50"
-          >
-            {running ? "submitting…" : "Run screen ▶"}
-          </button>
-        </div>
-      )}
-
-      {jobId && <Lifecycle jobId={jobId} />}
     </div>
   );
 }
 
-/** Editable ligand list: id + SMILES per row, add/remove, plus the sample shortcut. */
+/** Read-only, server-computed price. Re-quotes from the backend on ligand/param changes. */
+function PriceQuote() {
+  const { draft } = useJobDraft();
+  const [estimate, setEstimate] = useState<JobEstimate | null>(null);
+  const [estimating, setEstimating] = useState(false);
+
+  useEffect(() => {
+    const sdfLigands = draft.ligands.filter((l) => l.sdf);
+    if (sdfLigands.length === 0) {
+      setEstimate(null);
+      return;
+    }
+    let cancelled = false;
+    setEstimating(true);
+    const timer = setTimeout(async () => {
+      try {
+        const e = await estimateJob(sdfLigands, draft.params);
+        if (!cancelled) setEstimate(e);
+      } catch {
+        if (!cancelled) setEstimate(null);
+      } finally {
+        if (!cancelled) setEstimating(false);
+      }
+    }, 400);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [draft.ligands, draft.params]);
+
+  return (
+    <div className="flex-1 space-y-0.5">
+      {estimate ? (
+        <p className="font-mono text-sm text-foreground">
+          {estimate.price}{" "}
+          <span className="text-[10px] text-muted">
+            ({estimate.num_ligands} ligand{estimate.num_ligands === 1 ? "" : "s"})
+          </span>
+        </p>
+      ) : (
+        <p className="font-mono text-sm text-muted">
+          {estimating ? "pricing…" : "upload ligands to price"}
+        </p>
+      )}
+      <p className="font-mono text-[10px] text-muted">
+        set by the network · locked at payment
+      </p>
+    </div>
+  );
+}
+
+/** SDF-only ligand list: editable id + molecule preview per row, plus an .sdf uploader. */
 function LigandEditor() {
   const job = useJobDraft();
   const { ligands } = job.draft;
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [note, setNote] = useState<string | null>(null);
+
+  async function addSdfFiles(list: FileList | null) {
+    if (!list || list.length === 0) return;
+    const texts = await Promise.all(Array.from(list).map((f) => f.text()));
+    const parsed = texts.flatMap((t) => parseSdf(t));
+    if (parsed.length === 0) {
+      setNote("no molecules found in that file");
+      return;
+    }
+    job.addLigands(parsed);
+    setNote(`added ${parsed.length} ligand${parsed.length === 1 ? "" : "s"}`);
+  }
 
   return (
     <div className="flex-1 space-y-1.5">
-      {ligands.length === 0 && (
-        <button
-          type="button"
-          onClick={job.loadSampleLigands}
-          className="rounded-md border border-border bg-surface-2 px-2.5 py-1 text-xs text-muted hover:text-foreground"
-        >
-          load sample (aspirin + decoy)
-        </button>
-      )}
-
-      {ligands.map((l, i) => (
-        <div key={i} className="flex items-center gap-1.5">
-          <input
-            value={l.id}
-            onChange={(e) => job.updateLigand(i, { id: e.target.value })}
-            placeholder="id"
-            className="w-20 shrink-0 rounded border border-border bg-surface-2 px-1.5 py-1 font-mono text-[11px] text-accent-bright outline-none focus:border-accent"
-          />
-          {l.sdf && !l.smiles ? (
-            <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-muted">
-              {ligandPreview(l)}
-            </span>
-          ) : (
+      {ligands.map((l, i) => {
+        const invalid = !l.sdf; // SMILES-only (e.g. chat-filled) — backend rejects these
+        return (
+          <div key={i} className="flex items-center gap-1.5">
             <input
-              value={l.smiles ?? ""}
-              onChange={(e) => job.updateLigand(i, { smiles: e.target.value })}
-              placeholder="SMILES"
-              spellCheck={false}
-              className="min-w-0 flex-1 rounded border border-border bg-surface-2 px-1.5 py-1 font-mono text-[11px] text-foreground outline-none focus:border-accent"
+              value={l.id}
+              onChange={(e) => job.updateLigand(i, { id: e.target.value })}
+              placeholder="id"
+              className="w-20 shrink-0 rounded border border-border bg-surface-2 px-1.5 py-1 font-mono text-[11px] text-accent-bright outline-none focus:border-accent"
             />
-          )}
-          <button
-            type="button"
-            onClick={() => job.removeLigand(i)}
-            title="Remove ligand"
-            className="shrink-0 px-1 text-muted hover:text-amber-400"
-          >
-            ×
-          </button>
-        </div>
-      ))}
+            <span
+              className={`min-w-0 flex-1 truncate font-mono text-[11px] ${
+                invalid ? "text-amber-400" : "text-muted"
+              }`}
+              title={invalid ? "SMILES is not supported — upload an SDF" : undefined}
+            >
+              {invalid ? "SMILES — upload SDF instead" : ligandPreview(l)}
+            </span>
+            <button
+              type="button"
+              onClick={() => job.removeLigand(i)}
+              title="Remove ligand"
+              className="shrink-0 px-1 text-muted hover:text-amber-400"
+            >
+              ×
+            </button>
+          </div>
+        );
+      })}
 
+      <input
+        ref={fileRef}
+        type="file"
+        accept=".sdf,.mol"
+        multiple
+        className="hidden"
+        onChange={(e) => {
+          addSdfFiles(e.target.files);
+          e.target.value = "";
+        }}
+      />
       <button
         type="button"
-        onClick={() => job.addLigands([{ id: `lig_${ligands.length + 1}`, smiles: "" }])}
+        onClick={() => fileRef.current?.click()}
         className="rounded-md border border-dashed border-border px-2.5 py-1 font-mono text-[10px] text-muted hover:border-accent/50 hover:text-foreground"
       >
-        + add ligand
+        + add ligand SDF
       </button>
+
+      {note && (
+        <p className="font-mono text-[10px] text-accent-bright">{note}</p>
+      )}
     </div>
   );
 }
@@ -304,7 +335,7 @@ function Lifecycle({ jobId }: { jobId: string }) {
   const state = status?.state;
 
   return (
-    <div className="space-y-3 px-4 py-3">
+    <div className="space-y-3">
       {state && <PipelineStepper state={state} />}
       {state === "failed" && status?.reason && (
         <p className="rounded-lg border border-red-500/30 bg-red-500/5 px-3 py-2 font-mono text-[11px] text-red-300">

@@ -5,10 +5,12 @@ import type {
   CreateJobResponse,
   DockResult,
   Escrow,
+  JobParams,
   JobSpec,
   JobsListResponse,
   JobState,
   JobStatus,
+  Ligand,
   Proof,
   RunJobResponse,
 } from "./types";
@@ -46,6 +48,48 @@ export async function createJob(spec: JobSpec): Promise<CreateJobResponse> {
     body: JSON.stringify(spec),
   });
   return json<CreateJobResponse>(res);
+}
+
+/** The backend's server-computed price quote (POST /jobs/estimate). */
+export interface JobEstimate {
+  price: number;
+  num_ligands: number;
+  pricing: { source: string; rate_per_ligand: number };
+}
+
+/**
+ * Ask the backend to price a run before submitting — the price is ALWAYS computed
+ * server-side (the UI never sets it). The estimate endpoint expects the backend's
+ * internal JobSpec shape (a single multi-molecule `ligands_sdf`, not the FE ligand
+ * array), and only the ligand count actually affects the price, so receptor/box/
+ * researcher are sent as valid-but-nominal placeholders.
+ */
+export async function estimateJob(
+  ligands: Ligand[],
+  params: JobParams,
+): Promise<JobEstimate> {
+  const ligands_sdf = ligands
+    .map((l) => l.sdf ?? "")
+    .filter(Boolean)
+    .map((s) => (s.trimEnd().endsWith("$$$$") ? s : `${s.trimEnd()}\n$$$$\n`))
+    .join("");
+  const res = await fetch("/api/jobs/estimate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      receptor: { pdb_id: "0000" },
+      ligands_sdf: ligands_sdf || "$$$$\n",
+      box: { autobox_ligand: "ref_ligand" },
+      params: {
+        exhaustiveness: params.exhaustiveness,
+        num_modes: params.num_modes,
+        seed: params.seed,
+      },
+      payment: { supplier_id: "any" },
+      researcher_id: "estimate",
+    }),
+  });
+  return json<JobEstimate>(res);
 }
 
 /** On-chain config for the wallet lock flow (which Move package + arbiter + network). */

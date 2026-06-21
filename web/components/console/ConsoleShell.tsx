@@ -15,10 +15,17 @@ import { JobProvider, useJobDraft } from "@/lib/jobStore";
 import { StructurePane } from "./StructurePane";
 import { FilesPanel } from "./FilesPanel";
 import { RunsPanel } from "./RunsPanel";
+import { JobPanel } from "./JobPanel";
 import { ChatPane } from "./ChatPane";
 import { ConsoleRail } from "./ConsoleRail";
 
-type LeftView = "files" | "history";
+type LeftView = "job" | "files" | "history";
+
+const LEFT_LABELS: Record<LeftView, string> = {
+  job: "Docking job",
+  files: "Files",
+  history: "Job history",
+};
 
 export function ConsoleShell() {
   // Lock document scroll: the console is a fixed, single-screen workspace.
@@ -62,11 +69,12 @@ export function ConsoleShell() {
 function ConsoleBody() {
   const job = useJobDraft();
   const [leftOpen, setLeftOpen] = useState(true);
-  const [leftView, setLeftView] = useState<LeftView>("files");
+  const [leftView, setLeftView] = useState<LeftView>("job");
   const [structOpen, setStructOpen] = useState(true);
   // Remounting ChatPane (via key) is the cleanest full reset of its internal chat state.
   const [chatKey, setChatKey] = useState(0);
 
+  const jobActive = leftOpen && leftView === "job";
   const sidebarActive = leftOpen && leftView === "files";
   const historyActive = leftOpen && leftView === "history";
 
@@ -90,18 +98,20 @@ function ConsoleBody() {
     <div className="flex min-h-0 w-full flex-1 overflow-hidden">
       <ConsoleRail
         onNewChat={newChat}
+        jobActive={jobActive}
+        onToggleJob={() => selectLeft("job")}
         sidebarActive={sidebarActive}
         onToggleSidebar={() => selectLeft("files")}
         historyActive={historyActive}
         onToggleHistory={() => selectLeft("history")}
       />
 
-      {/* Left content pane — Files or Job history, chosen from the rail. */}
+      {/* Left content pane — Docking job, Files, or Job history, chosen from the rail. */}
       {leftOpen && (
-        <aside className="flex w-72 shrink-0 flex-col border-r border-border bg-surface">
+        <aside className="flex w-80 shrink-0 flex-col border-r border-border bg-surface">
           <div className="flex items-center justify-between border-b border-border px-3 py-2">
             <span className="font-mono text-[11px] uppercase tracking-wider text-muted">
-              {leftView === "files" ? "Files" : "Job history"}
+              {LEFT_LABELS[leftView]}
             </span>
             <button
               type="button"
@@ -113,7 +123,13 @@ function ConsoleBody() {
             </button>
           </div>
           <div className="min-h-0 flex-1 overflow-hidden">
-            {leftView === "files" ? <FilesPanel /> : <RunsPanel />}
+            {leftView === "job" ? (
+              <JobPanel />
+            ) : leftView === "files" ? (
+              <FilesPanel />
+            ) : (
+              <RunsPanel />
+            )}
           </div>
         </aside>
       )}

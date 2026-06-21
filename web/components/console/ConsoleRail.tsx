@@ -1,21 +1,26 @@
 "use client";
 
 /*
-  Far-left icon rail for the console — always visible. Three actions:
+  Far-left icon rail for the console — always visible. Actions:
     • New chat     — reset the conversation and clear the active job
-    • Sidebar      — toggle the Files pane (open/close)
+    • Docking job  — toggle the docking-job panel (open/close)
+    • Files        — toggle the Files pane (open/close)
     • Job history  — toggle the run-history pane (open/close)
   The rail owns no state; ConsoleBody passes handlers + active flags.
 */
 
 export function ConsoleRail({
   onNewChat,
+  jobActive,
+  onToggleJob,
   sidebarActive,
   onToggleSidebar,
   historyActive,
   onToggleHistory,
 }: {
   onNewChat: () => void;
+  jobActive: boolean;
+  onToggleJob: () => void;
   sidebarActive: boolean;
   onToggleSidebar: () => void;
   historyActive: boolean;
@@ -29,6 +34,9 @@ export function ConsoleRail({
 
       <div className="my-1 h-px w-5 bg-border" />
 
+      <RailButton label="Docking job" active={jobActive} onClick={onToggleJob}>
+        <JobIcon />
+      </RailButton>
       <RailButton label="Files" active={sidebarActive} onClick={onToggleSidebar}>
         <SidebarIcon />
       </RailButton>
@@ -78,6 +86,22 @@ function ComposeIcon() {
         strokeLinecap="round"
         strokeLinejoin="round"
       />
+    </svg>
+  );
+}
+
+function JobIcon() {
+  // A lab flask — the docking-job panel.
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+      <path
+        d="M9 3h6M10 3v6L5 19a1.5 1.5 0 0 0 1.4 2.1h11.2A1.5 1.5 0 0 0 19 19l-5-10V3"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path d="M7.5 14h9" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
     </svg>
   );
 }

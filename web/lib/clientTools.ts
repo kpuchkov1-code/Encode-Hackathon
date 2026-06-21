@@ -81,7 +81,6 @@ export function useClientTools() {
               }))
             : [];
           if (ligands.length > 0) job.setLigands(ligands);
-          if (typeof args.amount === "number") job.setAmount(args.amount);
           // Pull the current selection into the pocket if one isn't set yet.
           if (!job.draft.pocket && selection.selected.size > 0 && structure.text) {
             const box = boxFromSelection(structure.text, selection.selected);

@@ -11,7 +11,6 @@ import { runChat } from "@/lib/chat";
 import type { ChatMessage } from "@/lib/tools";
 import { useClientTools } from "@/lib/clientTools";
 import { ToolCallCard } from "./ToolCallCard";
-import { JobPanel } from "./JobPanel";
 
 const SUGGESTIONS = [
   "Clean this structure for docking",
@@ -128,9 +127,6 @@ export function ChatPane({
               {error}
             </div>
           )}
-
-          {/* Hybrid job panel — appears once there are ligands or a pocket to show. */}
-          <JobPanel />
         </div>
       </div>
 

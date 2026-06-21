@@ -25,8 +25,6 @@ export interface PocketState {
 export interface JobDraft {
   ligands: Ligand[];
   pocket: PocketState | null;
-  amount: number;
-  supplierId: string;
   params: JobParams;
 }
 
@@ -37,22 +35,14 @@ const DEFAULT_PARAMS: JobParams = {
   seed: 42,
 };
 
-const SAMPLE_LIGANDS: Ligand[] = [
-  { id: "lig_active", smiles: "CC(=O)Oc1ccccc1C(=O)O" },
-  { id: "lig_decoy", smiles: "CC" },
-];
-
 export interface JobStore {
   draft: JobDraft;
   setLigands: (ligands: Ligand[]) => void;
   addLigands: (ligands: Ligand[]) => void;
   updateLigand: (index: number, patch: Partial<Ligand>) => void;
   removeLigand: (index: number) => void;
-  loadSampleLigands: () => void;
   setPocketFromBox: (box: BoxSpec, label: string) => void;
   setAutobox: (refLigand: string) => void;
-  setAmount: (amount: number) => void;
-  setSupplier: (id: string) => void;
   setParams: (patch: Partial<JobParams>) => void;
   /** Active job id once Run has been clicked. */
   jobId: string | null;
@@ -66,8 +56,6 @@ export function JobProvider({ children }: { children: ReactNode }) {
   const [draft, setDraft] = useState<JobDraft>({
     ligands: [],
     pocket: null,
-    amount: 100,
-    supplierId: "node-1",
     params: DEFAULT_PARAMS,
   });
   const [jobId, setJobId] = useState<string | null>(null);
@@ -93,10 +81,6 @@ export function JobProvider({ children }: { children: ReactNode }) {
       setDraft((d) => ({ ...d, ligands: d.ligands.filter((_, i) => i !== index) })),
     [],
   );
-  const loadSampleLigands = useCallback(
-    () => setDraft((d) => ({ ...d, ligands: SAMPLE_LIGANDS })),
-    [],
-  );
   const setPocketFromBox = useCallback(
     (box: BoxSpec, label: string) =>
       setDraft((d) => ({ ...d, pocket: { box, label } })),
@@ -108,14 +92,6 @@ export function JobProvider({ children }: { children: ReactNode }) {
         ...d,
         pocket: { box: { autobox_ligand: refLigand }, label: `autobox: ${refLigand}` },
       })),
-    [],
-  );
-  const setAmount = useCallback(
-    (amount: number) => setDraft((d) => ({ ...d, amount })),
-    [],
-  );
-  const setSupplier = useCallback(
-    (id: string) => setDraft((d) => ({ ...d, supplierId: id })),
     [],
   );
   const setParams = useCallback(
@@ -130,7 +106,9 @@ export function JobProvider({ children }: { children: ReactNode }) {
       ligands: draft.ligands,
       box: draft.pocket?.box ?? { autobox_ligand: "ref_ligand" },
       params: draft.params,
-      payment: { amount: draft.amount, supplier_id: draft.supplierId },
+      // No amount — the backend always computes the price. supplier_id is "any":
+      // the control plane assigns jobs FIFO to whichever provider claims them.
+      payment: { supplier_id: "any" },
     }),
     [draft],
   );
@@ -142,11 +120,8 @@ export function JobProvider({ children }: { children: ReactNode }) {
       addLigands,
       updateLigand,
       removeLigand,
-      loadSampleLigands,
       setPocketFromBox,
       setAutobox,
-      setAmount,
-      setSupplier,
       setParams,
       jobId,
       setJobId,
@@ -158,11 +133,8 @@ export function JobProvider({ children }: { children: ReactNode }) {
       addLigands,
       updateLigand,
       removeLigand,
-      loadSampleLigands,
       setPocketFromBox,
       setAutobox,
-      setAmount,
-      setSupplier,
       setParams,
       jobId,
       buildSpec,
