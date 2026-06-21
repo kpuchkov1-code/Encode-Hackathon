@@ -28,7 +28,6 @@ import { stateReached } from "@/lib/types";
 import { ligandPreview, parseSdf } from "@/lib/ligands";
 import { PipelineStepper } from "../PipelineStepper";
 import { EscrowPanel } from "../EscrowPanel";
-import { ResultsTable } from "../ResultsTable";
 import { ProofPanel } from "../ProofPanel";
 
 export function JobPanel() {
@@ -343,7 +342,6 @@ function Lifecycle({ jobId }: { jobId: string }) {
         </p>
       )}
       <EscrowPanel escrow={escrow} />
-      {state && stateReached(state, "docked") && <ResultsTable result={result} />}
       {state && stateReached(state, "proven") && <ProofPanel proof={proof} />}
     </div>
   );

@@ -1,7 +1,6 @@
 "use client";
 
 import type { Escrow } from "@/lib/types";
-import { SponsorBadge } from "./SponsorBadge";
 import { suiscan, short } from "@/lib/explorer";
 
 const STATE_STYLES: Record<Escrow["state"], { dot: string; text: string; label: string }> = {
@@ -43,8 +42,6 @@ export function EscrowPanel({ escrow }: { escrow: Escrow | undefined }) {
       <div className="mb-4 flex items-center justify-between">
         <div className="flex items-center gap-2">
           <h2 className="text-sm font-semibold tracking-tight">Payment</h2>
-          <SponsorBadge name="DeepBook" />
-          <SponsorBadge name="Sui" />
         </div>
         {escrow && (
           <span className={`flex items-center gap-2 text-xs ${STATE_STYLES[escrow.state].text}`}>
@@ -61,7 +58,7 @@ export function EscrowPanel({ escrow }: { escrow: Escrow | undefined }) {
           <div className="flex items-baseline justify-between">
             <span className="text-sm text-muted">Amount</span>
             <span className="font-mono text-lg text-foreground">
-              {escrow.amount.toLocaleString()}{" "}
+              {escrow.amount.toLocaleString(undefined, { maximumFractionDigits: 9 })}{" "}
               <span className="text-xs text-muted">SUI</span>
             </span>
           </div>
@@ -70,11 +67,9 @@ export function EscrowPanel({ escrow }: { escrow: Escrow | undefined }) {
             <span className="font-mono text-sm text-foreground">{escrow.supplier_id}</span>
           </div>
           <div className="flex items-baseline justify-between border-t border-border pt-3">
-            <span className="flex items-center gap-2 text-sm text-muted">
-              Marketplace fee <SponsorBadge name="Solvimon" />
-            </span>
+            <span className="text-sm text-muted">Marketplace fee</span>
             <span className="font-mono text-sm text-muted">
-              {(escrow.amount * TAKE_RATE).toLocaleString()} (15%)
+              {(escrow.amount * TAKE_RATE).toLocaleString(undefined, { maximumFractionDigits: 9 })} (15%)
             </span>
           </div>
           {escrow.chain && (

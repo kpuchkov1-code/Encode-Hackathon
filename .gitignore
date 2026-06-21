@@ -26,3 +26,6 @@ move/escrow/build/
 # DeepBook bridge (isolated @mysten/sui v2 deps)
 deepbook-bridge/node_modules/
 deepbook-bridge/pool.json
+
+# ad-hoc structure downloads used for local testing
+fixtures/*.cif

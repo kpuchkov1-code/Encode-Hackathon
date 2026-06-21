@@ -2,7 +2,6 @@
 
 import type { Proof } from "@/lib/types";
 import { Copyable } from "./Copyable";
-import { SponsorBadge } from "./SponsorBadge";
 import { walrusBlob } from "@/lib/explorer";
 
 // The trust differentiator. The manifest hash is THE proof token; everything else
@@ -12,8 +11,6 @@ export function ProofPanel({ proof }: { proof: Proof | undefined }) {
     <div className="rounded-xl border border-accent/30 bg-surface p-5">
       <div className="mb-2 flex items-center gap-2">
         <h2 className="text-sm font-semibold tracking-tight">Proof of execution</h2>
-        <SponsorBadge name="Walrus" />
-        <SponsorBadge name="Sui" />
       </div>
       <p className="mb-4 text-[11px] text-muted">
         The result manifest is anchored on <span className="text-foreground">Walrus</span>{" "}

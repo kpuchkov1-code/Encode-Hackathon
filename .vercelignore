@@ -33,3 +33,9 @@ engine_entrypoint_vina.py
 install_worker.sh
 SESSION_HANDOFF.md
 README.md
+# Frontend (its own Vercel project) and Node bridges never run on the Python control plane.
+# NOTE: deepbook_log.py IS imported by api/index.py -- do NOT exclude it.
+web/
+sui-bridge/
+deepbook-bridge/
+move/

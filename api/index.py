@@ -977,7 +977,10 @@ def worker_callback(job_id: str, callback: WorkerCallback) -> dict:
     models.update_job(job_id, state="docked", result=callback.result)
 
     # Anchor a hashes-only manifest of this result on Walrus (best-effort, public,
-    # tamper-evident -- see walrus.py). Never identifies the molecules; never blocks.
+    # tamper-evident -- see walrus.py). Never identifies the molecules; never blocks. This
+    # runs BEFORE settlement on purpose: a job must not reach proven/settled without its
+    # Walrus proof anchored. The anchor takes a few seconds, which is the latency you see
+    # between `docked` and `settled` in the UI -- expected, not a stall.
     manifest = walrus.build_manifest(
         job_id, job["spec"]["params"]["seed"], "vina", callback.result or []
     )
@@ -1775,12 +1778,14 @@ def pay_page(job_id: str) -> str:
 # like the rest of these barebones pages.
 # --------------------------------------------------------------------------------------
 
-_admin_auth = HTTPBasic()
+_admin_auth = HTTPBasic(auto_error=False)
 
 
-def _require_admin(credentials: HTTPBasicCredentials = Depends(_admin_auth)) -> None:
+def _require_admin(credentials: Optional[HTTPBasicCredentials] = Depends(_admin_auth)) -> None:
     expected = os.environ.get("ADMIN_PASSWORD")
-    if not expected or not secrets.compare_digest(credentials.password, expected):
+    if not expected:
+        return  # no ADMIN_PASSWORD configured -> dashboard is open (no gate)
+    if credentials is None or not secrets.compare_digest(credentials.password, expected):
         raise HTTPException(status_code=401, detail="invalid admin credentials", headers={"WWW-Authenticate": "Basic"})
 
 

@@ -6,7 +6,6 @@ import { useEscrow, useJob, useProof, useResult } from "@/lib/hooks";
 import { stateReached } from "@/lib/types";
 import { PipelineStepper } from "./PipelineStepper";
 import { EscrowPanel } from "./EscrowPanel";
-import { ResultsTable } from "./ResultsTable";
 import { ProofPanel } from "./ProofPanel";
 import { ReceptorViewer } from "./ReceptorViewer";
 import { JobInfoBlock } from "./JobInfoBlock";
@@ -70,7 +69,6 @@ export function JobView({ id, pdb }: { id: string; pdb: string }) {
 
         {showResults && (
           <motion.div {...reveal} className="space-y-3">
-            <ResultsTable result={result} />
             <a
               href={`/api/jobs/${id}/download`}
               className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-surface px-3 py-1.5 text-sm text-foreground transition-colors hover:border-accent/50"
