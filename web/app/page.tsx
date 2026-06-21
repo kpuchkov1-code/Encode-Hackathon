@@ -22,7 +22,7 @@ export default function Home() {
       <section className="mx-auto flex min-h-[calc(100vh-5rem)] max-w-4xl flex-col items-center justify-center px-6 py-16 text-center">
         <h1 className="max-w-4xl text-5xl font-semibold leading-[1.05] tracking-tight drop-shadow-[0_2px_20px_rgba(0,0,0,0.6)] sm:text-6xl lg:text-7xl">
           The compute exchange for{" "}
-          <span className="text-orange-400">biomolecular science</span>
+          <span className="text-orange-400">biomolecular science</span>.
         </h1>
 
         {/* The two doors */}
