@@ -7,6 +7,7 @@ import type {
   Escrow,
   JobSpec,
   JobsListResponse,
+  JobState,
   JobStatus,
   Proof,
   RunJobResponse,
@@ -45,6 +46,50 @@ export async function createJob(spec: JobSpec): Promise<CreateJobResponse> {
     body: JSON.stringify(spec),
   });
   return json<CreateJobResponse>(res);
+}
+
+/** On-chain config for the wallet lock flow (which Move package + arbiter + network). */
+export interface ChainInfo {
+  onchain: boolean;
+  packageId?: string;
+  module?: string;
+  arbiter?: string;
+  network?: string;
+}
+
+export const getChainInfo = (): Promise<ChainInfo> => fetcher("/api/chain/info");
+
+/** What the wallet needs to lock the right amount for this job. `onchain:false` => no wallet step. */
+export interface PaymentIntent {
+  job_id: string;
+  price: number;
+  amount_mist: number;
+  onchain: boolean;
+  package_id?: string;
+  module?: string;
+  arbiter?: string;
+  network?: string;
+}
+
+/** Researcher accepts the price. On-chain: returns a payment intent to lock. Off-chain: queues. */
+export async function confirmJob(
+  id: string,
+): Promise<{ job_id: string; state: JobState; payment?: PaymentIntent }> {
+  const res = await fetch(`/api/jobs/${id}/confirm`, { method: "POST" });
+  return json(res);
+}
+
+/** Tell the backend the wallet locked the escrow; it verifies on-chain, then queues the job. */
+export async function recordEscrowLock(
+  id: string,
+  escrowObjectId: string,
+): Promise<{ job_id: string; state: JobState }> {
+  const res = await fetch(`/api/jobs/${id}/escrow-locked`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ escrow_object_id: escrowObjectId }),
+  });
+  return json(res);
 }
 
 export const getJobsList = (): Promise<JobsListResponse> => fetcher("/api/jobs");

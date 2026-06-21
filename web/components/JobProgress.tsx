@@ -5,7 +5,7 @@ import { LIFECYCLE, type JobState } from "@/lib/types";
 // Compact inline 5-dot lifecycle stepper for a single job row on the provider feed.
 // Mirrors the buyer-side PipelineStepper so the two sides read as one marketplace.
 
-const SHORT: Record<Exclude<JobState, "failed">, string> = {
+const SHORT: Record<Exclude<JobState, "failed" | "pending_payment">, string> = {
   queued: "Queued",
   running: "Running",
   docked: "Docked",
@@ -19,6 +19,14 @@ export function JobProgress({ state }: { state: JobState }) {
       <span className="inline-flex items-center gap-1.5 text-xs text-red-300">
         <span className="h-1.5 w-1.5 rounded-full bg-red-500" />
         failed · refunded
+      </span>
+    );
+  }
+  if (state === "pending_payment") {
+    return (
+      <span className="inline-flex items-center gap-1.5 text-xs text-amber-300">
+        <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
+        awaiting payment
       </span>
     );
   }
@@ -47,7 +55,7 @@ export function JobProgress({ state }: { state: JobState }) {
         })}
       </span>
       <span className="font-mono text-[11px] text-accent-bright">
-        {SHORT[state as Exclude<JobState, "failed">]}
+        {SHORT[state as Exclude<JobState, "failed" | "pending_payment">]}
       </span>
     </span>
   );

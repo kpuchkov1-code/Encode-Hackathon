@@ -2,6 +2,7 @@
 // The frontend codes to THESE shapes; the mock + real backend honor them.
 
 export type JobState =
+  | "pending_payment" // created, awaiting the on-chain escrow lock (wallet step)
   | "queued"
   | "running"
   | "docked"

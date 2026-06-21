@@ -11,6 +11,7 @@ import { useJobDraft } from "@/lib/jobStore";
 import type { JobState } from "@/lib/types";
 
 const STATE_DOT: Record<JobState, string> = {
+  pending_payment: "bg-amber-300",
   queued: "bg-amber-400",
   running: "bg-accent",
   docked: "bg-sky-400",

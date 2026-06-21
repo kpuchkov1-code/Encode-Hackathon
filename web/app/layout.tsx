@@ -4,6 +4,7 @@ import "./globals.css";
 import { Analytics } from "@vercel/analytics/next";
 import { Nav } from "@/components/Nav";
 import { AccountProvider } from "@/lib/account";
+import { WalletProviders } from "@/lib/wallet-providers";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -32,10 +33,12 @@ export default function RootLayout({
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
       <body className="min-h-full">
-        <AccountProvider>
-          <Nav />
-          {children}
-        </AccountProvider>
+        <WalletProviders>
+          <AccountProvider>
+            <Nav />
+            {children}
+          </AccountProvider>
+        </WalletProviders>
         <Analytics />
       </body>
     </html>

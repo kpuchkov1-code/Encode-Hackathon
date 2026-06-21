@@ -66,10 +66,16 @@ export function SubmitForm() {
 
     setSubmitting(true);
     try {
-      const { job_id } = await createJob(spec);
-      // Carry the PDB ID forward so the job page can render the receptor (the status
-      // endpoint doesn't echo the spec).
-      router.push(`/jobs/${job_id}?pdb=${encodeURIComponent(pdbId.trim())}`);
+      const { job_id, state } = await createJob(spec);
+      // Carry the PDB ID forward so the job/pay pages can render the receptor (the status
+      // endpoint doesn't echo the spec). On-chain, the job starts in `pending_payment` and
+      // must go through the wallet lock step first; off-chain it's already queued.
+      const q = `?pdb=${encodeURIComponent(pdbId.trim())}`;
+      router.push(
+        state === "pending_payment"
+          ? `/jobs/${job_id}/pay${q}`
+          : `/jobs/${job_id}${q}`,
+      );
     } catch (e) {
       setError(e instanceof Error ? e.message : "Submission failed.");
       setSubmitting(false);

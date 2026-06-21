@@ -4,7 +4,7 @@ import { motion } from "framer-motion";
 import { LIFECYCLE, type JobState } from "@/lib/types";
 
 const STEP_META: Record<
-  Exclude<JobState, "failed">,
+  Exclude<JobState, "failed" | "pending_payment">,
   { label: string; hint: string }
 > = {
   queued: { label: "Queued", hint: "escrow held" },

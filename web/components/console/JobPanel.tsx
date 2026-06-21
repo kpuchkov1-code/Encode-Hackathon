@@ -13,6 +13,7 @@
 */
 
 import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import { useJobDraft } from "@/lib/jobStore";
 import { useStructure } from "@/lib/structureStore";
 import { createJob, ApiError } from "@/lib/api";
@@ -27,6 +28,7 @@ import { ProofPanel } from "../ProofPanel";
 
 export function JobPanel() {
   const job = useJobDraft();
+  const router = useRouter();
   const { pdbId, uploaded, source, receptor } = useStructure();
   const [running, setRunning] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -68,6 +70,13 @@ export function JobPanel() {
     try {
       const spec = job.buildSpec(receptor);
       const res = await createJob(spec);
+      // On-chain, the job starts in `pending_payment` and needs the wallet lock step before
+      // it can queue -- hand off to the pay page (carrying the receptor PDB for rendering).
+      if (res.state === "pending_payment") {
+        const q = pdbId ? `?pdb=${encodeURIComponent(pdbId)}` : "";
+        router.push(`/jobs/${res.job_id}/pay${q}`);
+        return;
+      }
       job.setJobId(res.job_id);
       window.history.replaceState({}, "", `?job=${res.job_id}`);
     } catch (e) {
