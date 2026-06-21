@@ -14,6 +14,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+import { useCurrentAccount } from "@mysten/dapp-kit";
 import { useJobDraft } from "@/lib/jobStore";
 import { useStructure } from "@/lib/structureStore";
 import { createJob, ApiError } from "@/lib/api";
@@ -29,6 +30,7 @@ import { ProofPanel } from "../ProofPanel";
 export function JobPanel() {
   const job = useJobDraft();
   const router = useRouter();
+  const account = useCurrentAccount();
   const { pdbId, uploaded, source, receptor } = useStructure();
   const [running, setRunning] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -68,7 +70,7 @@ export function JobPanel() {
     }
     setRunning(true);
     try {
-      const spec = job.buildSpec(receptor);
+      const spec = { ...job.buildSpec(receptor), researcher: account?.address };
       const res = await createJob(spec);
       // On-chain, the job starts in `pending_payment` and needs the wallet lock step before
       // it can queue -- hand off to the pay page (carrying the receptor PDB for rendering).

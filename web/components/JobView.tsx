@@ -69,8 +69,14 @@ export function JobView({ id, pdb }: { id: string; pdb: string }) {
         <EscrowPanel escrow={escrow} />
 
         {showResults && (
-          <motion.div {...reveal}>
+          <motion.div {...reveal} className="space-y-3">
             <ResultsTable result={result} />
+            <a
+              href={`/api/jobs/${id}/download`}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-surface px-3 py-1.5 text-sm text-foreground transition-colors hover:border-accent/50"
+            >
+              ↓ Download results (.zip)
+            </a>
           </motion.div>
         )}
 

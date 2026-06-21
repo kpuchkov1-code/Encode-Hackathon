@@ -119,4 +119,55 @@ export async function runJob(
   return json<RunJobResponse>(res);
 }
 
+// ---- Provider registration + dashboard ----
+
+export interface ProviderIdentity {
+  worker_id: string;
+  token: string;
+  sui_address: string;
+  control_plane_url: string;
+  package_url: string;
+  run_command: string;
+}
+
+/** Register as a compute provider — issues a worker_id + token + the daemon run command. */
+export async function createProvider(
+  email: string,
+  suiAddress: string,
+): Promise<ProviderIdentity> {
+  const res = await fetch("/api/providers", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, sui_address: suiAddress }),
+  });
+  return json<ProviderIdentity>(res);
+}
+
+export interface ProviderRecord {
+  worker_id: string;
+  status: "online" | "offline";
+  sui_address?: string;
+  hardware_info?: string;
+  registered_at?: string;
+  jobs_completed?: number;
+  total_earned?: number;
+  jobs: { job_id: string; state: JobState; price: number | null; kind: string; created_at: string }[];
+}
+
+export const getProvider = (workerId: string): Promise<ProviderRecord> =>
+  fetcher(`/api/providers/${workerId}/json`);
+
+// ---- Researcher "my jobs" (keyed by wallet address) ----
+
+export interface MyJob {
+  job_id: string;
+  state: JobState;
+  price: number | null;
+  num_ligands: number;
+  created_at: string;
+}
+
+export const getMyJobs = (researcher: string): Promise<{ researcher: string; jobs: MyJob[] }> =>
+  fetcher(`/api/researchers/${encodeURIComponent(researcher)}/jobs`);
+
 export { ApiError };

@@ -671,6 +671,79 @@ def run_job(job_id: str, body: RunRequest) -> dict:
     return {"job_id": job_id, "state": _fe_state(job["state"]), "worker_id": worker_id}
 
 
+class ProviderSignup(BaseModel):
+    email: str
+    sui_address: str
+
+
+@app.post("/providers", status_code=201)
+def create_provider(body: ProviderSignup, request: Request) -> dict:
+    """SPA provider registration (JSON form of /providers/signup). Issues a worker identity
+    (idempotent by email) and returns the one-liner the provider runs on their machine to
+    start the daemon -- the SPA shows the command + package link. The token is returned once."""
+    sui = body.sui_address.strip()
+    if not _valid_sui_address(sui):
+        raise HTTPException(status_code=400, detail="A valid Sui payout address (0x + 64 hex chars) is required.")
+    identity = models.create_worker_identity(sui_address=sui, email=body.email)
+    base = str(request.base_url).rstrip("/")
+    return {
+        "worker_id": identity["worker_id"],
+        "token": identity["token"],
+        "sui_address": identity.get("sui_address", sui),
+        "control_plane_url": base,
+        "package_url": f"{base}/worker-package.zip",
+        "run_command": (
+            f"CONTROL_PLANE_URL={base} WORKER_ID={identity['worker_id']} "
+            f"WORKER_TOKEN={identity['token']} ./install_worker.sh"
+        ),
+    }
+
+
+@app.get("/researchers/{key}/jobs")
+def researcher_jobs_json(key: str) -> dict:
+    """The buyer's 'My jobs' list for the SPA, resolved from their wallet address (or email)
+    -- the same key passed as `researcher` at submit. Newest first, in FE-friendly shape."""
+    researcher = models.get_researcher_by_email(key)
+    if researcher is None:
+        return {"researcher": key, "jobs": []}
+    jobs = models.list_researcher_jobs(researcher["researcher_id"])
+    return {
+        "researcher": key,
+        "jobs": [
+            {
+                "job_id": j["job_id"],
+                "state": _fe_state(j["state"]),
+                "price": j.get("price"),
+                "num_ligands": _job_total_ligands(j),
+                "created_at": j.get("created_at") or "",
+            }
+            for j in jobs
+        ],
+    }
+
+
+@app.get("/providers/{worker_id}/json")
+def provider_json(worker_id: str) -> dict:
+    """Real worker record for the SPA provider dashboard (status, hardware, jobs, earnings).
+    Mirrors /workers/{id}/json but namespaced for the provider UI."""
+    worker = models.get_worker(worker_id)
+    if worker is None:
+        raise HTTPException(status_code=404)
+    worker.pop("token", None)
+    jobs = models.list_worker_jobs(worker_id)
+    worker["jobs"] = [
+        {
+            "job_id": j["job_id"],
+            "state": _fe_state(j["state"]),
+            "price": j.get("price"),
+            "kind": j.get("kind", "primary"),
+            "created_at": j.get("created_at") or "",
+        }
+        for j in jobs
+    ]
+    return worker
+
+
 @app.get("/jobs/{job_id}/download")
 def download_result(job_id: str) -> Response:
     """Zips the actual docked pose files (sent back inline in the worker callback,

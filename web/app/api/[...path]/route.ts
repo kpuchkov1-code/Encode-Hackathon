@@ -31,6 +31,15 @@ async function forward(req: NextRequest, path: string[]): Promise<Response> {
 
   try {
     const upstream = await fetch(target, init);
+    const contentType = upstream.headers.get("content-type") ?? "application/json";
+    // Binary responses (e.g. the results .zip from /jobs/<id>/download) must NOT be decoded
+    // as text — stream the bytes through and preserve the download headers.
+    if (!contentType.includes("application/json")) {
+      const headers = new Headers({ "Content-Type": contentType });
+      const dispo = upstream.headers.get("content-disposition");
+      if (dispo) headers.set("Content-Disposition", dispo);
+      return new Response(upstream.body, { status: upstream.status, headers });
+    }
     const text = await upstream.text();
     // Pass status + JSON through verbatim so the UI sees the contract's codes.
     return new Response(text, {

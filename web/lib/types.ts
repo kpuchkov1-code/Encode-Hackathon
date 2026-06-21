@@ -69,6 +69,8 @@ export interface JobSpec {
   box: Box;
   params: JobParams;
   payment: Payment;
+  /** Connected wallet address — the researcher identity the backend groups jobs under. */
+  researcher?: string;
 }
 
 // ---- Responses ----
@@ -127,6 +129,8 @@ export interface JobListItem {
   job_id: string;
   state: JobState;
   created_at: string;
+  price?: number | null;
+  supplier_id?: string;
 }
 
 export interface JobsListResponse {

@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
+import { useCurrentAccount } from "@mysten/dapp-kit";
 import { createJob } from "@/lib/api";
 import type { JobSpec, Ligand } from "@/lib/types";
 import { PRESETS, SAMPLE_JOB, SUPPLIERS } from "@/lib/presets";
@@ -16,6 +17,7 @@ function initialSpec(presetKey: string | null): JobSpec {
 export function SubmitForm() {
   const router = useRouter();
   const search = useSearchParams();
+  const account = useCurrentAccount();
   const seed = initialSpec(search.get("preset"));
 
   const [pdbId, setPdbId] = useState(seed.receptor.pdb_id ?? "6LU7");
@@ -62,6 +64,7 @@ export function SubmitForm() {
       box: { autobox_ligand: autobox },
       params,
       payment: { amount: Number(amount), supplier_id: supplierId },
+      researcher: account?.address,
     };
 
     setSubmitting(true);
