@@ -1,15 +1,64 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
+import { useCurrentAccount } from "@mysten/dapp-kit";
+import { shortAddr } from "@/components/AccountMenu";
 
-// Cosmetic settings for the demo. No persistence beyond local state.
+// Local settings for the demo: account display name + provider defaults, persisted to
+// localStorage so "Save changes" actually does something. Identity (the Sui address) is the
+// connected wallet — read-only here, never a hardcoded fake.
+
+const STORAGE_KEY = "dm_settings";
+
+type Settings = {
+  name: string;
+  email: string;
+  region: string;
+  rate: number;
+  notifyPaid: boolean;
+  notifyJobs: boolean;
+  interruptible: boolean;
+};
+
+const DEFAULTS: Settings = {
+  name: "",
+  email: "",
+  region: "eu-west-1",
+  rate: 100,
+  notifyPaid: true,
+  notifyJobs: true,
+  interruptible: false,
+};
+
 export default function SettingsPage() {
-  const [region, setRegion] = useState("eu-west-1");
-  const [rate, setRate] = useState(100);
-  const [notifyPaid, setNotifyPaid] = useState(true);
-  const [notifyJobs, setNotifyJobs] = useState(true);
-  const [interruptible, setInterruptible] = useState(false);
+  const account = useCurrentAccount();
+  const [s, setS] = useState<Settings>(DEFAULTS);
+  const [saved, setSaved] = useState(false);
+
+  // Load persisted settings once on mount.
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) setS({ ...DEFAULTS, ...JSON.parse(raw) });
+    } catch {
+      /* ignore malformed storage */
+    }
+  }, []);
+
+  const set = <K extends keyof Settings>(key: K, value: Settings[K]) => {
+    setS((prev) => ({ ...prev, [key]: value }));
+    setSaved(false);
+  };
+
+  const save = () => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
+      setSaved(true);
+    } catch {
+      /* ignore */
+    }
+  };
 
   return (
     <main className="mx-auto max-w-2xl px-6 py-10">
@@ -20,48 +69,62 @@ export default function SettingsPage() {
       <p className="mt-0.5 text-sm text-muted">Account, payouts and provider defaults.</p>
 
       <Section title="Account">
-        <Field label="Name">
-          <input defaultValue="Demo Lab" className="input" />
+        <Field label="Display name">
+          <input
+            value={s.name}
+            onChange={(e) => set("name", e.target.value)}
+            placeholder="e.g. Acme Bio Lab"
+            className="input"
+          />
         </Field>
         <Field label="Email">
-          <input defaultValue="demo@lab.bio" className="input font-mono" />
+          <input
+            value={s.email}
+            onChange={(e) => set("email", e.target.value)}
+            placeholder="you@lab.bio"
+            className="input font-mono"
+          />
         </Field>
       </Section>
 
-      <Section title="Payout wallet">
-        <Field label="Sui address">
-          <input
-            defaultValue="0x9f2a3c…b71e"
-            className="input font-mono"
-            spellCheck={false}
-          />
+      <Section title="Wallet">
+        <Field label="Connected Sui wallet (testnet)">
+          <div className="input flex items-center font-mono text-sm text-foreground">
+            {account ? shortAddr(account.address) : "—"}
+          </div>
         </Field>
         <p className="text-xs text-muted">
-          Earnings settle on-chain via DeepBook to this address.
+          {account
+            ? "This is your identity and the address that signs escrow locks. Connect or switch wallets from the Account menu."
+            : "No wallet connected. Connect one from the Account menu (top right) to set your identity."}
         </p>
       </Section>
 
       <Section title="Provider defaults">
         <Field label="Region">
-          <select value={region} onChange={(e) => setRegion(e.target.value)} className="input font-mono">
+          <select
+            value={s.region}
+            onChange={(e) => set("region", e.target.value)}
+            className="input font-mono"
+          >
             <option>eu-west-1</option>
             <option>us-east-1</option>
             <option>ap-south-1</option>
           </select>
         </Field>
-        <Field label="On-demand rate (credits / job)">
+        <Field label="Preferred rate (SUI / job, indicative)">
           <input
             type="number"
-            value={rate}
-            onChange={(e) => setRate(Number(e.target.value))}
+            value={s.rate}
+            onChange={(e) => set("rate", Number(e.target.value))}
             className="input font-mono"
           />
         </Field>
         <Toggle
           label="Accept interruptible jobs"
           desc="Cheaper for buyers, can be preempted"
-          on={interruptible}
-          onToggle={() => setInterruptible((v) => !v)}
+          on={s.interruptible}
+          onToggle={() => set("interruptible", !s.interruptible)}
         />
       </Section>
 
@@ -69,23 +132,27 @@ export default function SettingsPage() {
         <Toggle
           label="Job completed & paid"
           desc="Notify when escrow releases to your node"
-          on={notifyPaid}
-          onToggle={() => setNotifyPaid((v) => !v)}
+          on={s.notifyPaid}
+          onToggle={() => set("notifyPaid", !s.notifyPaid)}
         />
         <Toggle
           label="New jobs available"
           desc="Notify when matching jobs hit the queue"
-          on={notifyJobs}
-          onToggle={() => setNotifyJobs((v) => !v)}
+          on={s.notifyJobs}
+          onToggle={() => set("notifyJobs", !s.notifyJobs)}
         />
       </Section>
 
-      <button
-        type="button"
-        className="mt-8 rounded-lg bg-accent px-5 py-2.5 text-sm font-medium text-white transition-colors hover:bg-accent-bright"
-      >
-        Save changes
-      </button>
+      <div className="mt-8 flex items-center gap-3">
+        <button
+          type="button"
+          onClick={save}
+          className="rounded-lg bg-accent px-5 py-2.5 text-sm font-medium text-white transition-colors hover:bg-accent-bright"
+        >
+          Save changes
+        </button>
+        {saved && <span className="font-mono text-xs text-emerald-400">saved ✓</span>}
+      </div>
     </main>
   );
 }

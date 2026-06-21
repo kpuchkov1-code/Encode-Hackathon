@@ -5,7 +5,7 @@
   sequence strip. This is the persistent "structure" surface (Amina's right pane).
 */
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useStructure } from "@/lib/structureStore";
 import { useJobDraft } from "@/lib/jobStore";
 import { useJob, useResult } from "@/lib/hooks";
@@ -20,6 +20,12 @@ export function StructurePane() {
   const { pdbId, setPdbId, loadText, parsed, status, text, uploaded, source } = useStructure();
   const [draft, setDraft] = useState(pdbId);
   const fileRef = useRef<HTMLInputElement>(null);
+
+  // Keep the input in sync when the active structure changes outside this field (e.g. an
+  // upload, or the copilot loading a structure) so it never lingers on the previous id.
+  useEffect(() => {
+    setDraft(pdbId);
+  }, [pdbId]);
 
   async function onUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
@@ -52,7 +58,7 @@ export function StructurePane() {
           <input
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
-            placeholder="PDB ID (e.g. 6LU7)"
+            placeholder="PDB ID"
             className="input font-mono uppercase"
             spellCheck={false}
           />

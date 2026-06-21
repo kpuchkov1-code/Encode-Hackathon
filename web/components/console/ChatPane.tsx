@@ -15,8 +15,8 @@ import { ToolCallCard } from "./ToolCallCard";
 const SUGGESTIONS = [
   "Clean this structure for docking",
   "Highlight residues A:140-145",
-  "Dock aspirin against the current pocket",
-  "What does CNN affinity tell me?",
+  "Set the docking pocket from my selection",
+  "How do I run a docking job here?",
 ];
 
 export function ChatPane({
@@ -30,7 +30,6 @@ export function ChatPane({
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
-  const [web, setWeb] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -158,8 +157,14 @@ export function ChatPane({
           </div>
           <div className="mt-2 flex items-center gap-1.5">
             <Toggle active={filesOpen} onClick={onToggleFiles} label="Files" />
-            <Toggle active label="Tools" />
-            <Toggle active={web} onClick={() => setWeb((v) => !v)} label="🌐 Web Search" />
+            {/* Status indicator, not a control: the copilot drives the viewer + job tools
+                automatically (and web search when its key is configured server-side). */}
+            <span
+              title="The copilot uses viewer, job and web tools automatically"
+              className="rounded-lg border border-border bg-surface px-2.5 py-1 text-xs text-muted"
+            >
+              Tools on
+            </span>
           </div>
         </div>
       </div>

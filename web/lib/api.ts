@@ -50,6 +50,18 @@ export async function createJob(spec: JobSpec): Promise<CreateJobResponse> {
   return json<CreateJobResponse>(res);
 }
 
+/**
+ * Advance a job through the proof-then-pay layer by one bounded step (docked -> proof on
+ * Walrus -> proven -> settled). Idempotent and retriable; safe to call repeatedly while a
+ * job is `docked`/`proven`. See POST /jobs/{id}/finalize on the backend.
+ */
+export async function finalizeJob(
+  id: string,
+): Promise<{ state: string; proof_pending?: boolean }> {
+  const res = await fetch(`/api/jobs/${id}/finalize`, { method: "POST" });
+  return json(res);
+}
+
 /** The backend's server-computed price quote (POST /jobs/estimate). */
 export interface JobEstimate {
   price: number;
@@ -165,9 +177,25 @@ export async function runJob(
 
 // ---- Provider registration + dashboard ----
 
+export interface ResearcherIdentity {
+  researcher_id: string;
+  email: string;
+}
+
+/** Researcher sign-up/sign-in by email (idempotent). The email is the account identity. */
+export async function createResearcher(email: string): Promise<ResearcherIdentity> {
+  const res = await fetch("/api/researchers", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email }),
+  });
+  return json<ResearcherIdentity>(res);
+}
+
 export interface ProviderIdentity {
   worker_id: string;
   token: string;
+  email: string;
   sui_address: string;
   control_plane_url: string;
   package_url: string;
@@ -190,6 +218,7 @@ export async function createProvider(
 export interface ProviderRecord {
   worker_id: string;
   status: "online" | "offline";
+  email?: string;
   sui_address?: string;
   hardware_info?: string;
   registered_at?: string;

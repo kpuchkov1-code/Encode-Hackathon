@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useCurrentAccount } from "@mysten/dapp-kit";
+import { useResearcher } from "@/lib/researcher-identity";
 import { createJob } from "@/lib/api";
 import type { JobSpec, Ligand } from "@/lib/types";
 import { PRESETS, SAMPLE_JOB, SUPPLIERS } from "@/lib/presets";
@@ -18,6 +19,7 @@ export function SubmitForm() {
   const router = useRouter();
   const search = useSearchParams();
   const account = useCurrentAccount();
+  const { identity: researcher } = useResearcher();
   const seed = initialSpec(search.get("preset"));
 
   const [pdbId, setPdbId] = useState(seed.receptor.pdb_id ?? "6LU7");
@@ -64,7 +66,7 @@ export function SubmitForm() {
       box: { autobox_ligand: autobox },
       params,
       payment: { amount: Number(amount), supplier_id: supplierId },
-      researcher: account?.address,
+      researcher: researcher?.email ?? account?.address,
     };
 
     setSubmitting(true);
@@ -99,7 +101,7 @@ export function SubmitForm() {
         <div className="grid gap-3 sm:grid-cols-2">
           <SuggestionCard
             title="Load sample"
-            subtitle="Aspirin vs decoy on 6LU7"
+            subtitle="Aspirin vs decoy (sample)"
             onClick={() => loadPreset("sample")}
           />
           <SuggestionCard
@@ -114,7 +116,7 @@ export function SubmitForm() {
           <input
             value={pdbId}
             onChange={(e) => setPdbId(e.target.value)}
-            placeholder="6LU7"
+            placeholder="4-character PDB ID"
             className="input font-mono uppercase"
           />
         </Field>

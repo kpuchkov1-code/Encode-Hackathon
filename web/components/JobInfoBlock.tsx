@@ -14,9 +14,22 @@ export function JobInfoBlock({
   result: DockResult | undefined;
   proof: Proof | undefined;
 }) {
-  const best = result
-    ? [...result.ligands].sort((a, b) => b.cnn_affinity - a.cnn_affinity)[0]
+  // Rank by CNN affinity when present (higher = better), else by Vina affinity (lower =
+  // better). Jobs run without CNN rescoring (`cnn: "none"`) have no cnn_affinity, so this
+  // must never assume it exists.
+  const ligands = result?.ligands ?? [];
+  const hasCnn = ligands.some((l) => typeof l.cnn_affinity === "number");
+  const best = ligands.length
+    ? [...ligands].sort((a, b) =>
+        hasCnn
+          ? (b.cnn_affinity ?? -Infinity) - (a.cnn_affinity ?? -Infinity)
+          : (a.vina_affinity ?? Infinity) - (b.vina_affinity ?? Infinity),
+      )[0]
     : undefined;
+  const bestScore =
+    best && typeof (best.cnn_affinity ?? best.vina_affinity) === "number"
+      ? (best.cnn_affinity ?? best.vina_affinity)
+      : undefined;
 
   return (
     <div className="rounded-xl border border-border bg-surface p-4">
@@ -37,7 +50,8 @@ export function JobInfoBlock({
         <Row label="top_binder">
           {best ? (
             <span className="font-mono text-foreground/90">
-              {best.ligand_id} ({best.cnn_affinity.toFixed(2)})
+              {best.ligand_id}
+              {bestScore !== undefined ? ` (${bestScore.toFixed(2)})` : ""}
             </span>
           ) : (
             <Dash />

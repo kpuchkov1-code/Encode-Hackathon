@@ -1,0 +1,4 @@
+{
+  "builds": [{ "src": "api/bridge.mjs", "use": "@vercel/node" }],
+  "routes": [{ "src": "/api/([^/?]+)", "dest": "/api/bridge.mjs?op=$1" }]
+}

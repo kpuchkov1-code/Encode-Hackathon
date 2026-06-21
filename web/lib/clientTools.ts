@@ -74,23 +74,22 @@ export function useClientTools() {
           return { pocket: label, center: box.center, size: box.size };
         }
         case "submit_job": {
-          const ligands = Array.isArray(args.ligands)
-            ? (args.ligands as { id: string; smiles: string }[]).map((l) => ({
-                id: String(l.id),
-                smiles: String(l.smiles),
-              }))
-            : [];
-          if (ligands.length > 0) job.setLigands(ligands);
-          // Pull the current selection into the pocket if one isn't set yet.
+          // The job panel is SDF-only — SMILES can't be turned into a runnable ligand here,
+          // so this tool only prepares the pocket. Pull the current selection into the pocket
+          // if one isn't set yet; ligands come from an uploaded SDF.
           if (!job.draft.pocket && selection.selected.size > 0 && structure.text) {
             const box = boxFromSelection(structure.text, selection.selected);
             if (box) job.setPocketFromBox(box, selection.summary);
           }
+          const ligandCount = job.draft.ligands.filter((l) => l.sdf).length;
           return {
-            filled: true,
-            ligands: ligands.length || job.draft.ligands.length,
-            pocket: job.draft.pocket?.label ?? "not set",
-            note: "job panel filled; the user must review and click Run to start it",
+            prepared: true,
+            pocket: job.draft.pocket?.label ?? "auto-box (no residues selected)",
+            ligands: ligandCount,
+            next:
+              ligandCount > 0
+                ? "Job panel is ready — tell the user to review and click Run."
+                : "Tell the user to upload a ligand SDF in the job panel (SMILES are not supported), then click Run.",
           };
         }
         default:

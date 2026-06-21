@@ -4,8 +4,9 @@
 //  - poll job + escrow every ~1.5s, STOP once the job reaches a terminal state
 //  - fetch result only once docked, proof only once proven (avoids 409 spam)
 
+import { useEffect } from "react";
 import useSWR from "swr";
-import { fetcher, getEscrow } from "./api";
+import { fetcher, finalizeJob, getEscrow } from "./api";
 import {
   type DockResult,
   type Escrow,
@@ -17,6 +18,41 @@ import {
 } from "./types";
 
 const POLL_MS = 1500;
+
+/**
+ * Drives the proof-then-pay layer from the browser: while a job sits at `docked` or
+ * `proven`, repeatedly POST /finalize so it advances (docked -> proof on Walrus -> proven
+ * -> settled). Each call is one bounded server step; retries cover Walrus latency. A worker
+ * can drive this too, but doing it here means an open job page always pushes a job through.
+ */
+export function useFinalizeDriver(
+  id: string | null,
+  state: JobStatus["state"] | undefined,
+) {
+  const active = state === "docked" || state === "proven";
+  useEffect(() => {
+    if (!id || !active) return;
+    let cancelled = false;
+    let inFlight = false;
+    const tick = async () => {
+      if (cancelled || inFlight) return;
+      inFlight = true;
+      try {
+        await finalizeJob(id);
+      } catch {
+        /* transient — the next tick retries */
+      } finally {
+        inFlight = false;
+      }
+    };
+    void tick();
+    const t = setInterval(tick, POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, [id, active]);
+}
 
 export function useHealth() {
   const { data, error } = useSWR<{ status: string }>("/api/health", fetcher, {
@@ -50,6 +86,23 @@ export function useResult(id: string | null, state: JobStatus["state"] | undefin
   const ready = !!state && stateReached(state, "docked");
   const { data } = useSWR<DockResult>(
     id && ready ? `/api/jobs/${id}/result` : null,
+    fetcher,
+  );
+  return data;
+}
+
+export interface ReceptorInfo {
+  kind: "file" | "pdb_id";
+  pdb?: string;
+  pdb_id?: string;
+  label?: string;
+}
+
+/** The actual receptor a job was submitted with (uploaded PDB text or a PDB id). Static
+ *  per job, so fetched once — lets the job page render the real structure, never a default. */
+export function useReceptor(id: string | null) {
+  const { data } = useSWR<ReceptorInfo>(
+    id ? `/api/jobs/${id}/receptor` : null,
     fetcher,
   );
   return data;

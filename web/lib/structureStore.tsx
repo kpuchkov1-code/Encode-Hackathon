@@ -74,6 +74,10 @@ export function StructureProvider({
     setStatus("ready");
     setSource(label);
     setUploaded(true);
+    // Make the uploaded file the active structure id so nothing still shows the previous
+    // (e.g. default) PDB id. Derive a display id from the filename, sans extension.
+    const derived = label.replace(/\.[^.]+$/, "").trim().toUpperCase();
+    setPdbIdState(derived || "UPLOAD");
   }, []);
 
   const loadStructure = useCallback(
@@ -130,8 +134,11 @@ export function StructureProvider({
     };
   }, [id, validId]);
 
+  // Always submit the loaded structure inline as `file` when we have it (uploaded OR
+  // fetched-by-id), so the sealed engine container never has to fetch from RCSB. The
+  // original PDB id is carried separately (receptor_pdb_id at submit) for the display label.
   const receptor: Receptor =
-    uploaded && text ? { file: text } : { pdb_id: pdbId.trim().toUpperCase() };
+    text ? { file: text } : { pdb_id: pdbId.trim().toUpperCase() };
 
   const value = useMemo<StructureStore>(
     () => ({

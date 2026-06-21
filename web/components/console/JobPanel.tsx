@@ -20,10 +20,11 @@
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useCurrentAccount } from "@mysten/dapp-kit";
+import { useResearcher } from "@/lib/researcher-identity";
 import { useJobDraft } from "@/lib/jobStore";
 import { useStructure } from "@/lib/structureStore";
 import { createJob, estimateJob, ApiError, type JobEstimate } from "@/lib/api";
-import { useJob, useEscrow, useResult, useProof } from "@/lib/hooks";
+import { useJob, useEscrow, useResult, useProof, useFinalizeDriver } from "@/lib/hooks";
 import { stateReached } from "@/lib/types";
 import { ligandPreview, parseSdf } from "@/lib/ligands";
 import { PipelineStepper } from "../PipelineStepper";
@@ -34,6 +35,7 @@ export function JobPanel() {
   const job = useJobDraft();
   const router = useRouter();
   const account = useCurrentAccount();
+  const { identity: researcher } = useResearcher();
   const { pdbId, uploaded, source, receptor, text: receptorText } = useStructure();
   const [running, setRunning] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -59,7 +61,14 @@ export function JobPanel() {
     }
     setRunning(true);
     try {
-      const spec = { ...job.buildSpec(receptor), researcher: account?.address };
+      // Identity is the signed-in email (the "My jobs" key); fall back to the wallet address.
+      // The receptor is submitted inline (file); pass the PDB id (when not an upload) so the
+      // job page still labels the structure with its id.
+      const spec = {
+        ...job.buildSpec(receptor),
+        researcher: researcher?.email ?? account?.address,
+        receptor_pdb_id: !uploaded && pdbId ? pdbId.trim().toUpperCase() : undefined,
+      };
       const res = await createJob(spec);
       // The backend creates the job in `pending_payment`; the pay page runs confirm ->
       // (off-chain: queue) or (on-chain: wallet lock) and shows the real backend price.
@@ -332,6 +341,8 @@ function Lifecycle({ jobId }: { jobId: string }) {
   const result = useResult(jobId, status?.state);
   const proof = useProof(jobId, status?.state);
   const state = status?.state;
+  // Push the job through proof -> payment while it's docked/proven.
+  useFinalizeDriver(jobId, state);
 
   return (
     <div className="space-y-3">

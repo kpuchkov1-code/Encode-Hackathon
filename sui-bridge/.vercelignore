@@ -1,0 +1,8 @@
+# Secrets + local-only tooling must never be uploaded — env comes from Vercel project env.
+.env.local
+node_modules
+_testlock.mjs
+transfer_sui.mjs
+cli.mjs
+server.mjs
+README.md

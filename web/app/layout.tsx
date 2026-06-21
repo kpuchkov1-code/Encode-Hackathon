@@ -3,8 +3,8 @@ import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { Analytics } from "@vercel/analytics/next";
 import { Nav } from "@/components/Nav";
-import { AccountProvider } from "@/lib/account";
 import { WalletProviders } from "@/lib/wallet-providers";
+import { ResearcherProvider } from "@/lib/researcher-identity";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -34,10 +34,10 @@ export default function RootLayout({
     >
       <body className="min-h-full">
         <WalletProviders>
-          <AccountProvider>
+          <ResearcherProvider>
             <Nav />
             {children}
-          </AccountProvider>
+          </ResearcherProvider>
         </WalletProviders>
         <Analytics />
       </body>

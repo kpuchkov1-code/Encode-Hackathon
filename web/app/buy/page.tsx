@@ -4,18 +4,18 @@ import { SponsorBadge } from "@/components/SponsorBadge";
 const CARDS = [
   {
     title: "Run the sample screen",
-    subtitle: "Aspirin vs decoy on 6LU7 (SARS Mpro) — load and submit",
+    subtitle: "Aspirin vs decoy (SARS Mpro) — load and submit",
     href: "/submit?preset=sample",
   },
   {
     title: "Submit your own job",
-    subtitle: "Pick a receptor PDB ID, add ligand SMILES, choose a GPU supplier",
+    subtitle: "Pick a receptor PDB ID, upload a ligand SDF, choose a GPU supplier",
     href: "/submit",
   },
   {
     title: "Inspect a proof",
     subtitle: "See the SHA-256 manifest that proves your molecule ran unaltered",
-    href: "/submit?preset=sample",
+    href: "/jobs",
   },
   {
     title: "Trigger a failure",

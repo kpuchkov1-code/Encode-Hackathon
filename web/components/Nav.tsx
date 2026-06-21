@@ -1,6 +1,5 @@
 import Link from "next/link";
 import { AccountMenu } from "./AccountMenu";
-import { ComputeBalance } from "./ComputeBalance";
 import { Logo } from "./Logo";
 
 export function Nav() {
@@ -22,7 +21,6 @@ export function Nav() {
             <BookIcon />
             <span className="hidden sm:inline">Docs</span>
           </Link>
-          <ComputeBalance />
           <AccountMenu />
         </div>
       </div>

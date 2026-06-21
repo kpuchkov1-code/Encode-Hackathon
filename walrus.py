@@ -27,6 +27,10 @@ WALRUS_AGGREGATOR_URL = os.environ.get(
     "WALRUS_AGGREGATOR_URL", "https://aggregator.walrus-testnet.walrus.space"
 )
 WALRUS_EPOCHS = int(os.environ.get("WALRUS_EPOCHS", "5"))
+# Cap how long the anchor may block the worker callback. The callback runs in a serverless
+# function with a bounded duration, so a slow/hung publisher must give up well before the
+# function's limit -- otherwise the function is killed mid-anchor and the job never settles.
+WALRUS_TIMEOUT = int(os.environ.get("WALRUS_TIMEOUT", "8"))
 
 
 def _sha256(text: str) -> str:
@@ -73,7 +77,7 @@ def publish_manifest(manifest: dict) -> dict | None:
         resp = requests.put(
             f"{WALRUS_PUBLISHER_URL.rstrip('/')}/v1/blobs?epochs={WALRUS_EPOCHS}",
             data=body,
-            timeout=45,
+            timeout=WALRUS_TIMEOUT,
         )
         resp.raise_for_status()
         data = resp.json()

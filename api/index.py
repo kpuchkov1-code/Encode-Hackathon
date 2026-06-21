@@ -318,6 +318,11 @@ class JobSpec(BaseModel):
     params: ParamsSpec
     payment: PaymentSpec
     researcher_id: str
+    # Display-only: the original PDB id when the receptor was given by id but resolved to
+    # inline `file` text at submit (so the sealed engine container never needs network /
+    # `requests`). Lets the job page still label the structure with its PDB id. Ignored by
+    # the engine.
+    receptor_pdb_id: Optional[str] = None
 
 
 @app.post("/jobs/estimate")
@@ -369,6 +374,9 @@ class FeJobSpec(BaseModel):
     box: BoxSpec
     params: ParamsSpec
     payment: FePayment = FePayment()
+    # When the frontend sends the structure as inline `file` (so the engine never fetches),
+    # it passes the original PDB id here for the job page's display label. Optional.
+    receptor_pdb_id: Optional[str] = None
     # Researcher identity for "my jobs" grouping. In the on-chain product this is the
     # researcher's wallet address; email also works. Optional -- falls back to a shared
     # anonymous identity so a wallet-only user can still submit.
@@ -394,6 +402,45 @@ def _ligands_to_sdf(ligands: list[FeLigand]) -> str:
     return "".join(blocks)
 
 
+def _receptor_text(receptor: ReceptorSpec) -> Optional[str]:
+    """Raw PDB text for a receptor — the uploaded file, or fetched from RCSB by id."""
+    try:
+        if receptor.file:
+            return receptor.file
+        if receptor.pdb_id:
+            import requests
+
+            r = requests.get(
+                f"https://files.rcsb.org/download/{receptor.pdb_id}.pdb", timeout=20
+            )
+            r.raise_for_status()
+            return r.text
+    except Exception:  # noqa: BLE001 -- box resolution must never block submission
+        return None
+    return None
+
+
+def _resolve_box(box: BoxSpec, receptor: ReceptorSpec, receptor_text: Optional[str] = None) -> BoxSpec:
+    """Make the docking box valid for THIS receptor. An explicit center/size or a genuine
+    reference-ligand SDF is targeted docking and kept as-is. Anything else — notably the
+    frontend's `autobox_ligand: "ref_ligand"` placeholder used when the researcher hasn't
+    picked a pocket — is meaningless for an arbitrary protein and makes the engine error on
+    a garbage box. In that case we fall back to a whole-protein box derived from the actual
+    receptor, so any PDB docks (blind, less targeted) instead of failing."""
+    if box.center is not None and box.size is not None:
+        return box
+    autobox = box.autobox_ligand or ""
+    if "V2000" in autobox or "V3000" in autobox:  # a real SDF molfile -> keep
+        return box
+    text = receptor_text or _receptor_text(receptor)
+    if not text:
+        return box
+    try:
+        return BoxSpec(**default_box_from_receptor(text))
+    except Exception:  # noqa: BLE001 -- if we can't, leave it and let the engine report
+        return box
+
+
 @app.post("/jobs", status_code=202)
 def submit_job(spec: FeJobSpec) -> dict:
     """SPA job submission (API_CONTRACT.md). Returns `{job_id, state, price}` -- state is
@@ -402,13 +449,25 @@ def submit_job(spec: FeJobSpec) -> dict:
     researcher = models.get_researcher_by_email(spec.researcher or "") or None
     if researcher is None:
         researcher = models.create_researcher_identity(spec.researcher or ANON_RESEARCHER_EMAIL)
+    # Prefer inline PDB text so the sealed engine container never needs network/`requests`
+    # (it failed with "No module named 'requests'" on the pdb_id fetch path). The frontend
+    # sends the already-loaded structure as `file` (+ `receptor_pdb_id` for display); an API
+    # caller that sends only `pdb_id` is resolved here as a fallback.
+    engine_receptor = spec.receptor
+    receptor_pdb_id = spec.receptor_pdb_id
+    if spec.receptor.pdb_id:
+        text = _receptor_text(spec.receptor)
+        if text:
+            engine_receptor = ReceptorSpec(file=text)
+            receptor_pdb_id = receptor_pdb_id or spec.receptor.pdb_id
     internal = JobSpec(
-        receptor=spec.receptor,
+        receptor=engine_receptor,
         ligands_sdf=_ligands_to_sdf(spec.ligands),
-        box=spec.box,
+        box=_resolve_box(spec.box, engine_receptor),
         params=spec.params,
         payment=PaymentSpec(supplier_id=spec.payment.supplier_id),
         researcher_id=researcher["researcher_id"],
+        receptor_pdb_id=receptor_pdb_id,
     )
     return _submit_internal(internal)
 
@@ -569,6 +628,26 @@ def get_escrow(job_id: str) -> dict:
     return record
 
 
+@app.get("/jobs/{job_id}/receptor")
+def get_receptor(job_id: str) -> dict:
+    """The ACTUAL receptor a job was submitted with, so any page can render the real
+    structure instead of a hardcoded/default one. Returns the uploaded PDB text verbatim
+    when the researcher uploaded a file, otherwise the PDB id (the client fetches that from
+    RCSB). No default — a job with neither yields an empty result."""
+    job = models.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    spec = job.get("spec") or {}
+    receptor = spec.get("receptor") or {}
+    if receptor.get("file"):
+        # Inline PDB text. If it was resolved from a pdb_id at submit, show that id;
+        # otherwise it's a user upload.
+        label = spec.get("receptor_pdb_id") or "uploaded"
+        return {"kind": "file", "pdb": receptor["file"], "pdb_id": spec.get("receptor_pdb_id") or "", "label": label}
+    pdb_id = receptor.get("pdb_id") or ""
+    return {"kind": "pdb_id", "pdb_id": pdb_id, "label": pdb_id}
+
+
 @app.get("/jobs/{job_id}/result")
 def get_result(job_id: str) -> dict:
     """Docking results in the SPA contract's DockResult shape. The Vina engine produces a
@@ -671,6 +750,24 @@ def run_job(job_id: str, body: RunRequest) -> dict:
     return {"job_id": job_id, "state": _fe_state(job["state"]), "worker_id": worker_id}
 
 
+class ResearcherSignup(BaseModel):
+    email: str
+
+
+@app.post("/researchers", status_code=201)
+def create_researcher(body: ResearcherSignup) -> dict:
+    """SPA researcher sign-up/sign-in (JSON form of /researchers/signup). The email is the
+    identity; signing in again with the same email returns the same account. Idempotent."""
+    email = (body.email or "").strip()
+    if "@" not in email or "." not in email.split("@")[-1]:
+        raise HTTPException(status_code=400, detail="A valid email is required.")
+    identity = models.create_researcher_identity(email)
+    return {
+        "researcher_id": identity["researcher_id"],
+        "email": identity.get("email", email),
+    }
+
+
 class ProviderSignup(BaseModel):
     email: str
     sui_address: str
@@ -689,6 +786,7 @@ def create_provider(body: ProviderSignup, request: Request) -> dict:
     return {
         "worker_id": identity["worker_id"],
         "token": identity["token"],
+        "email": identity.get("email", "") or _norm_email(body.email),
         "sui_address": identity.get("sui_address", sui),
         "control_plane_url": base,
         "package_url": f"{base}/worker-package.zip",
@@ -974,43 +1072,80 @@ def worker_callback(job_id: str, callback: WorkerCallback) -> dict:
         models.escrow_refund(job_id)
         return {"ok": True}
 
+    # Primary docking finished: results are in. Mark `docked` and STOP. The Walrus proof
+    # and the escrow release are executed by a separate, retriable layer
+    # (POST /jobs/{id}/finalize) -- so the slow proof step can't blow this function's time
+    # budget, and, per product rule, the provider is paid ONLY after the proof is anchored.
     models.update_job(job_id, state="docked", result=callback.result)
+    return {"ok": True, "state": "docked"}
 
-    # Anchor a hashes-only manifest of this result on Walrus (best-effort, public,
-    # tamper-evident -- see walrus.py). Never identifies the molecules; never blocks. This
-    # runs BEFORE settlement on purpose: a job must not reach proven/settled without its
-    # Walrus proof anchored. The anchor takes a few seconds, which is the latency you see
-    # between `docked` and `settled` in the UI -- expected, not a stall.
-    manifest = walrus.build_manifest(
-        job_id, job["spec"]["params"]["seed"], "vina", callback.result or []
-    )
-    anchor = walrus.publish_manifest(manifest)
-    if anchor:
-        models.update_job_extra(job_id, walrus=anchor)
 
-    # Optimistic verification: re-dock a sample on an INDEPENDENT worker before paying.
-    # Needs a second, currently-online worker; with none available we can't verify, so we
-    # settle now and record that no independent check was possible (no silent gap).
-    if VERIFY_SAMPLE_FRACTION > 0 and _independent_worker_available(job.get("claimed_by")):
-        sub_sdf = sample_ligands_for_verification(
-            job["spec"]["ligands_sdf"], VERIFY_SAMPLE_FRACTION, job_id
+@app.post("/jobs/{job_id}/finalize")
+def finalize_job(job_id: str) -> dict:
+    """Proof-then-pay layer. Idempotent and retriable; each call does at most ONE bounded
+    step, so it always fits the serverless time budget. Driven by the provider worker and/or
+    the job page poll until the job reaches a terminal state:
+
+      docked  -> EXECUTE THE PROOF: anchor the hashes-only manifest on Walrus. Once anchored,
+                 either kick off independent verification (`verifying`) or mark `proven`.
+                 If Walrus is enabled but the anchor hasn't landed, stay `docked` so the
+                 caller retries -- the job never advances (or pays) without its proof.
+      proven  -> release escrow to the provider (PAYMENT) and mark `settled`.
+
+    Payment is therefore impossible before the Walrus proof exists.
+    """
+    job = models.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    state = job["state"]
+
+    if state == "docked":
+        # Anchor the proof (time-bounded by WALRUS_TIMEOUT). publish_manifest returns None
+        # when Walrus is disabled OR the attempt failed/timed out.
+        manifest = walrus.build_manifest(
+            job_id, job["spec"]["params"]["seed"], "vina", job.get("result") or []
         )
-        sub_spec = {**job["spec"], "ligands_sdf": sub_sdf}
-        verifier_job_id = models.create_verification_job(
-            parent_job_id=job_id, spec=sub_spec, exclude_worker=job.get("claimed_by")
-        )
-        models.update_job(job_id, state="verifying")
-        models.update_job_extra(job_id, verification={
-            "status": "pending",
-            "verifier_job_id": verifier_job_id,
-            "sample_fraction": VERIFY_SAMPLE_FRACTION,
-            "tolerance_kcal": VERIFY_TOLERANCE_KCAL,
-        })
-        return {"ok": True, "verifying": True, "verifier_job_id": verifier_job_id}
+        anchor = walrus.publish_manifest(manifest)
+        if anchor:
+            models.update_job_extra(job_id, walrus=anchor)
+        elif walrus.WALRUS_ENABLED:
+            return {"state": "docked", "proof_pending": True}
 
-    note = None if VERIFY_SAMPLE_FRACTION <= 0 else "no independent verifier online"
-    _settle_primary(job, note=note)
-    return {"ok": True}
+        # Proof anchored. Re-dock a sample on an independent worker if one is online;
+        # otherwise the anchored manifest is the proof -> `proven`.
+        if VERIFY_SAMPLE_FRACTION > 0 and _independent_worker_available(job.get("claimed_by")):
+            sub_sdf = sample_ligands_for_verification(
+                job["spec"]["ligands_sdf"], VERIFY_SAMPLE_FRACTION, job_id
+            )
+            sub_spec = {**job["spec"], "ligands_sdf": sub_sdf}
+            verifier_job_id = models.create_verification_job(
+                parent_job_id=job_id, spec=sub_spec, exclude_worker=job.get("claimed_by")
+            )
+            models.update_job(job_id, state="verifying")
+            models.update_job_extra(job_id, verification={
+                "status": "pending",
+                "verifier_job_id": verifier_job_id,
+                "sample_fraction": VERIFY_SAMPLE_FRACTION,
+                "tolerance_kcal": VERIFY_TOLERANCE_KCAL,
+            })
+            return {"state": "verifying", "verifier_job_id": verifier_job_id}
+        models.update_job(job_id, state="proven")
+        return {"state": "proven"}
+
+    if state == "proven":
+        # Proof is in place -> release payment now. On-chain release goes through the
+        # signing bridge; if that's unreachable (e.g. the bridge tunnel is down) the release
+        # raises. Don't 500 -- keep the job `proven` so the caller retries, and settlement
+        # resumes automatically once the bridge is back. Payment is never lost or duplicated
+        # (escrow_release is a no-op once the escrow is already released).
+        try:
+            _settle_primary(job)
+        except Exception as exc:  # noqa: BLE001 -- surface as retriable, not a crash
+            return {"state": "proven", "payment_pending": True, "error": str(exc)[:200]}
+        return {"state": models.get_job(job_id)["state"]}
+
+    # verifying -> awaiting the verifier callback; terminal/other -> nothing to do.
+    return {"state": state}
 
 
 def _independent_worker_available(original_worker_id: str | None) -> bool:
@@ -1026,15 +1161,25 @@ def _independent_worker_available(original_worker_id: str | None) -> bool:
 
 
 def _settle_primary(job: dict, *, note: str | None = None) -> None:
-    """Release escrow to the provider and mark the primary job settled. `note` records
-    why verification was skipped, when it was."""
+    """Release escrow to the provider and mark the primary job settled. Idempotent and
+    resumable: the slow on-chain release runs ONLY while the escrow is still `held`, so a
+    retry after a partial settlement -- escrow released on-chain but the serverless function
+    died before marking `settled` -- finishes the job WITHOUT re-calling the bridge (a second
+    release would abort on an already-consumed escrow). `note` records why verification was
+    skipped, when it was."""
     job_id = job["job_id"]
-    provider_address = None
-    if job.get("claimed_by"):
-        worker = models.get_worker(job["claimed_by"])
-        provider_address = (worker or {}).get("sui_address") or None
-    released = models.escrow_release(job_id, proof=True, provider_address=provider_address)
-    if released:
+    escrow = models.escrow_status(job_id)
+    escrow_state = (escrow or {}).get("state")
+    if escrow_state == "held":
+        provider_address = None
+        if job.get("claimed_by"):
+            worker = models.get_worker(job["claimed_by"])
+            provider_address = (worker or {}).get("sui_address") or None
+        # May raise if the on-chain signing bridge is unreachable; the caller turns that into
+        # a retriable `payment_pending` so nothing is lost.
+        if models.escrow_release(job_id, proof=True, provider_address=provider_address):
+            escrow_state = "released"
+    if escrow_state == "released" and models.get_job(job_id).get("state") != "settled":
         models.update_job(job_id, state="settled")
         if job.get("claimed_by"):
             models.increment_worker_stats(job["claimed_by"], completed=True, earned=job.get("price", 0))

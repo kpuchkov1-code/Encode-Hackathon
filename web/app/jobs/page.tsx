@@ -1,36 +1,37 @@
 "use client";
 
 /*
-  Buyer "My jobs" — every job submitted from the connected wallet, newest first, with the
-  right next action per job (pay if still pending_payment, otherwise view). Keyed off the
-  wallet address (the researcher identity used at submit). Replaces the original
-  /researchers/jobs server page.
+  Buyer "My jobs" — every job submitted under the signed-in researcher, newest first, with
+  the right next action per job (pay if still pending_payment, otherwise view). Keyed off the
+  researcher identity used at submit: the signed-in email, or the wallet address as fallback.
 */
 
 import Link from "next/link";
 import useSWR from "swr";
 import { useCurrentAccount } from "@mysten/dapp-kit";
 import { getMyJobs, type MyJob } from "@/lib/api";
+import { useResearcher } from "@/lib/researcher-identity";
 import { isTerminal } from "@/lib/types";
 import { JobProgress } from "@/components/JobProgress";
 
 export default function MyJobsPage() {
   const account = useCurrentAccount();
-  const address = account?.address;
+  const { identity } = useResearcher();
+  const key = identity?.email ?? account?.address;
 
   const { data, isLoading } = useSWR(
-    address ? ["my-jobs", address] : null,
-    () => getMyJobs(address as string),
+    key ? ["my-jobs", key] : null,
+    () => getMyJobs(key as string),
     { refreshInterval: 4000 },
   );
 
-  if (!address) {
+  if (!key) {
     return (
       <main className="mx-auto max-w-3xl px-6 py-16">
         <h1 className="text-2xl font-semibold">My jobs</h1>
-        <p className="mt-3 text-sm text-neutral-400">
-          Connect your Sui wallet (top right) to see the jobs you’ve submitted. Your wallet is
-          your identity — jobs are grouped under the address that paid for them.
+        <p className="mt-3 text-sm text-muted">
+          Sign in with your email (Account, top right) to see the jobs you’ve submitted. Your
+          email is your identity — jobs are grouped under it.
         </p>
       </main>
     );
@@ -49,7 +50,7 @@ export default function MyJobsPage() {
           + Submit another
         </Link>
       </div>
-      <p className="mt-1 font-mono text-xs text-neutral-500">{address}</p>
+      <p className="mt-1 font-mono text-xs text-muted">{key}</p>
 
       <div className="mt-6 flex gap-6 text-sm">
         <Stat n={jobs.length} label="total" />

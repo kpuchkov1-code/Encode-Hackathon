@@ -2,7 +2,7 @@
 
 import { motion } from "framer-motion";
 import Link from "next/link";
-import { useEscrow, useJob, useProof, useResult } from "@/lib/hooks";
+import { useEscrow, useFinalizeDriver, useJob, useProof, useReceptor, useResult } from "@/lib/hooks";
 import { stateReached } from "@/lib/types";
 import { PipelineStepper } from "./PipelineStepper";
 import { EscrowPanel } from "./EscrowPanel";
@@ -21,6 +21,9 @@ export function JobView({ id, pdb }: { id: string; pdb: string }) {
   const escrow = useEscrow(id, job?.state);
   const result = useResult(id, job?.state);
   const proof = useProof(id, job?.state);
+  const receptor = useReceptor(id);
+  // Push the job through proof -> payment while it's docked/proven.
+  useFinalizeDriver(id, job?.state);
 
   if (error) {
     return (
@@ -88,7 +91,11 @@ export function JobView({ id, pdb }: { id: string; pdb: string }) {
       {/* RIGHT — persistent viewer + metadata */}
       <div className="space-y-3 lg:sticky lg:top-20 lg:self-start">
         <div className="h-[380px]">
-          <ReceptorViewer pdbId={pdb} />
+          <ReceptorViewer
+            pdbId={receptor?.pdb_id ?? pdb}
+            pdbText={receptor?.pdb ?? null}
+            label={receptor?.label}
+          />
         </div>
         <JobInfoBlock job={job} result={result} proof={proof} />
       </div>

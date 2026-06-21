@@ -69,22 +69,11 @@ export const TOOL_DEFS: ToolDef[] = [
     function: {
       name: "submit_job",
       description:
-        "Fill the job panel with a docking specification so the user can review and run it. Use the currently loaded receptor and current residue selection as the pocket when available. Does NOT start the job; the user clicks Run.",
+        "Prepare the job panel for the user to review and run: set the docking pocket from the current residue selection (when available) against the loaded receptor. Ligands must be an uploaded multi-molecule SDF — the panel is SDF-only and does NOT accept SMILES — and the price is set by the network, so this tool takes no ligand or price arguments. Does NOT start the job; the user uploads ligands and clicks Run.",
       parameters: {
         type: "object",
-        properties: {
-          ligands: {
-            type: "array",
-            description: "Ligands to dock, each with an id and a SMILES string.",
-            items: {
-              type: "object",
-              properties: { id: str("short id"), smiles: str("SMILES string") },
-              required: ["id", "smiles"],
-            },
-          },
-          amount: { type: "number", description: "Payment amount (marketplace units)." },
-        },
-        required: ["ligands"],
+        properties: {},
+        required: [],
       },
     },
   },

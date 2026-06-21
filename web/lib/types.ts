@@ -72,6 +72,8 @@ export interface JobSpec {
   payment: Payment;
   /** Connected wallet address — the researcher identity the backend groups jobs under. */
   researcher?: string;
+  /** Original PDB id when the receptor is submitted inline as `file` — display label only. */
+  receptor_pdb_id?: string;
 }
 
 // ---- Responses ----
