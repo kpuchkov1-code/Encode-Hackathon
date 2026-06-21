@@ -3,6 +3,7 @@
 import type { Proof } from "@/lib/types";
 import { Copyable } from "./Copyable";
 import { SponsorBadge } from "./SponsorBadge";
+import { walrusBlob } from "@/lib/explorer";
 
 // The trust differentiator. The manifest hash is THE proof token; everything else
 // is the audit trail of what was hashed into it.
@@ -45,7 +46,16 @@ export function ProofPanel({ proof }: { proof: Proof | undefined }) {
             <Row label="storage_blob_id">
               <span className="flex items-center gap-2">
                 <Copyable value={proof.storage_blob_id} truncate />
-                <span className="text-[10px] text-muted">stored on Walrus</span>
+                {proof.storage_blob_id && (
+                  <a
+                    href={walrusBlob(proof.storage_blob_id)}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-[10px] text-accent-bright hover:underline"
+                  >
+                    on Walrus ↗
+                  </a>
+                )}
               </span>
             </Row>
             <Row label="gnina_version">

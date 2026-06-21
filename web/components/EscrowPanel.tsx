@@ -2,6 +2,7 @@
 
 import type { Escrow } from "@/lib/types";
 import { SponsorBadge } from "./SponsorBadge";
+import { suiscan, short } from "@/lib/explorer";
 
 const STATE_STYLES: Record<Escrow["state"], { dot: string; text: string; label: string }> = {
   held: { dot: "bg-amber-500", text: "text-amber-300", label: "Held in escrow" },
@@ -10,6 +11,31 @@ const STATE_STYLES: Record<Escrow["state"], { dot: string; text: string; label: 
 };
 
 const TAKE_RATE = 0.15;
+
+function OnChainLink({
+  label,
+  href,
+  value,
+}: {
+  label: string;
+  href?: string | false;
+  value?: string;
+}) {
+  if (!href || !value) return null;
+  return (
+    <div className="flex items-center justify-between">
+      <span className="text-muted">{label}</span>
+      <a
+        href={href}
+        target="_blank"
+        rel="noreferrer"
+        className="font-mono text-accent-bright hover:underline"
+      >
+        {short(value)} ↗
+      </a>
+    </div>
+  );
+}
 
 export function EscrowPanel({ escrow }: { escrow: Escrow | undefined }) {
   return (
@@ -50,6 +76,16 @@ export function EscrowPanel({ escrow }: { escrow: Escrow | undefined }) {
               {(escrow.amount * TAKE_RATE).toLocaleString()} (15%)
             </span>
           </div>
+          {escrow.chain && (
+            <div className="space-y-1 border-t border-border pt-3 text-[11px]">
+              <OnChainLink label="Escrow object" href={escrow.chain.escrow_object_id && suiscan.object(escrow.chain.escrow_object_id)} value={escrow.chain.escrow_object_id} />
+              <OnChainLink label="Locked by" href={escrow.chain.payer && suiscan.account(escrow.chain.payer)} value={escrow.chain.payer} />
+              <OnChainLink label="Lock tx" href={escrow.chain.lock_digest && suiscan.tx(escrow.chain.lock_digest)} value={escrow.chain.lock_digest} />
+              <OnChainLink label="Release tx" href={escrow.chain.release_digest && suiscan.tx(escrow.chain.release_digest)} value={escrow.chain.release_digest} />
+              <OnChainLink label="Refund tx" href={escrow.chain.refund_digest && suiscan.tx(escrow.chain.refund_digest)} value={escrow.chain.refund_digest} />
+              <OnChainLink label="Paid to provider" href={escrow.chain.paid_to && suiscan.account(escrow.chain.paid_to)} value={escrow.chain.paid_to} />
+            </div>
+          )}
           <p className="text-[11px] text-muted">
             Settled on-chain via DeepBook order-book escrow.
           </p>

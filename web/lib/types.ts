@@ -94,10 +94,25 @@ export interface RunJobResponse {
 }
 
 export type EscrowState = "held" | "released" | "refunded";
+
+/** On-chain escrow detail (present when the backend runs real Sui escrow). */
+export interface EscrowChain {
+  network?: string;
+  amount_mist?: number;
+  escrow_object_id?: string;
+  payer?: string;
+  arbiter?: string;
+  lock_digest?: string;
+  release_digest?: string;
+  refund_digest?: string;
+  paid_to?: string;
+}
+
 export interface Escrow {
   state: EscrowState;
   amount: number;
   supplier_id: string;
+  chain?: EscrowChain;
 }
 
 export interface LigandResult {
