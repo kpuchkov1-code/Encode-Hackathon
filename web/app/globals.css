@@ -1,0 +1,102 @@
+@import "tailwindcss";
+
+/*
+  Docking Marketplace — dark technical theme (AminoAnalytica-inspired).
+  Near-black canvas, single blue accent, monospace for machine values.
+  Forced dark; no light-mode flip.
+*/
+
+@theme inline {
+  --color-background: #0a0a0b;
+  --color-surface: #141416;
+  --color-surface-2: #1b1b1f;
+  --color-border: #26262b;
+  --color-foreground: #ededee;
+  --color-muted: #8a8a93;
+  --color-accent: #3b82f6;
+  --color-accent-bright: #60a5fa;
+  /* Residue selection only — never used for status. Mirrors Amina's orange. */
+  --color-select: #f59e0b;
+  --color-select-bright: #fbbf24;
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  background: var(--color-background);
+  color: var(--color-foreground);
+  font-family: var(--font-sans), Arial, Helvetica, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Subtle radial glow behind hero content */
+.bg-grid-glow {
+  background-image: radial-gradient(
+    60% 50% at 50% 0%,
+    rgba(59, 130, 246, 0.08) 0%,
+    rgba(10, 10, 11, 0) 70%
+  );
+}
+
+/* Form inputs — shared dark field style */
+.input {
+  width: 100%;
+  border-radius: 0.5rem;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  padding: 0.5rem 0.75rem;
+  font-size: 0.875rem;
+  color: var(--color-foreground);
+  outline: none;
+}
+.input:focus {
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 1px var(--color-accent);
+}
+.input::placeholder {
+  color: var(--color-muted);
+}
+
+/* Pulse used by the active pipeline node */
+@keyframes node-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.5);
+  }
+  50% {
+    box-shadow: 0 0 0 6px rgba(59, 130, 246, 0);
+  }
+}
+.animate-node-pulse {
+  animation: node-pulse 1.6s ease-in-out infinite;
+}
+
+/*
+  Page transition — replayed on every route change via app/template.tsx (which remounts on
+  navigation). A gentle fade + rise + de-blur so pages ease in instead of snapping.
+*/
+@keyframes page-transition-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+    filter: blur(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+    filter: blur(0);
+  }
+}
+.page-transition {
+  animation: page-transition-in 0.32s cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: opacity, transform, filter;
+}
+@media (prefers-reduced-motion: reduce) {
+  .page-transition {
+    animation: none;
+  }
+}
