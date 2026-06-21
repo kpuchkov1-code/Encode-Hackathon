@@ -23,7 +23,7 @@ import {
 export const dynamic = "force-dynamic";
 
 const GATEWAY_URL = "https://ai-gateway.vercel.sh/v1/chat/completions";
-const MODEL = process.env.AI_GATEWAY_MODEL ?? "anthropic/claude-sonnet-4.6";
+const MODEL = process.env.AI_GATEWAY_MODEL ?? "anthropic/claude-haiku-4.5";
 const BACKEND_BASE_URL = process.env.BACKEND_BASE_URL ?? "http://localhost:8000";
 const MAX_ITERS = 6;
 
