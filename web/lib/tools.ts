@@ -185,7 +185,7 @@ export function toolsForGateway() {
   return TOOL_DEFS.map(({ type, function: fn }) => ({ type, function: fn }));
 }
 
-export const SYSTEM_PROMPT = `You are the copilot for DockMarket, a decentralized marketplace where idle GPUs run real molecular docking (gnina). You help a scientist load and clean a receptor, choose a binding pocket by selecting residues, submit a docking screen, and interpret the results.
+export const SYSTEM_PROMPT = `You are the copilot for DockMarket, a decentralized marketplace where idle GPUs run real molecular docking. You help a scientist load and clean a receptor, choose a binding pocket by selecting residues, submit a docking screen, and interpret the results.
 
 Guidelines:
 - Be concise and scientific. Use monospace-friendly plain text; no markdown headers.

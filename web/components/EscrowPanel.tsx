@@ -44,6 +44,7 @@ export function EscrowPanel({ escrow }: { escrow: Escrow | undefined }) {
         <div className="flex items-center gap-2">
           <h2 className="text-sm font-semibold tracking-tight">Payment</h2>
           <SponsorBadge name="DeepBook" />
+          <SponsorBadge name="Sui" />
         </div>
         {escrow && (
           <span className={`flex items-center gap-2 text-xs ${STATE_STYLES[escrow.state].text}`}>
@@ -61,7 +62,7 @@ export function EscrowPanel({ escrow }: { escrow: Escrow | undefined }) {
             <span className="text-sm text-muted">Amount</span>
             <span className="font-mono text-lg text-foreground">
               {escrow.amount.toLocaleString()}{" "}
-              <span className="text-xs text-muted">credits</span>
+              <span className="text-xs text-muted">SUI</span>
             </span>
           </div>
           <div className="flex items-baseline justify-between">
@@ -87,7 +88,9 @@ export function EscrowPanel({ escrow }: { escrow: Escrow | undefined }) {
             </div>
           )}
           <p className="text-[11px] text-muted">
-            Settled on-chain via DeepBook order-book escrow.
+            Funds are locked and released on the <span className="text-foreground">Sui blockchain</span>{" "}
+            via <span className="text-foreground">DeepBook</span> order-book escrow — held on submit,
+            released to the provider only on a verified result, refunded to you if the job fails.
           </p>
         </div>
       )}

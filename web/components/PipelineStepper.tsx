@@ -7,11 +7,11 @@ const STEP_META: Record<
   Exclude<JobState, "failed" | "pending_payment">,
   { label: string; hint: string }
 > = {
-  queued: { label: "Queued", hint: "escrow held" },
-  running: { label: "Running", hint: "gnina on GPU" },
+  queued: { label: "Queued", hint: "escrow locked · DeepBook (Sui)" },
+  running: { label: "Running", hint: "docking on GPU" },
   docked: { label: "Docked", hint: "results ready" },
-  proven: { label: "Proven", hint: "stored on Walrus" },
-  settled: { label: "Settled", hint: "payment released" },
+  proven: { label: "Proven", hint: "proof on Walrus (Sui)" },
+  settled: { label: "Settled", hint: "paid out · DeepBook (Sui)" },
 };
 
 type NodeStatus = "done" | "active" | "pending" | "failed";

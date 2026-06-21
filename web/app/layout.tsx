@@ -19,7 +19,7 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: "DockMarket — Decentralized Docking Marketplace",
   description:
-    "Submit molecular docking jobs to idle GPUs. On-chain escrow, cryptographic proof of execution, real gnina binding-affinity scores.",
+    "Submit molecular docking jobs to idle GPUs. On-chain escrow and settlement on Sui (DeepBook), cryptographic proof of execution on Walrus, real binding-affinity scores.",
 };
 
 export default function RootLayout({

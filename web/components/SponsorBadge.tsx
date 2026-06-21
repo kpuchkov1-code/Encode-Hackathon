@@ -2,9 +2,9 @@
 // Judges look for real roles, not decoration — these sit on the panels that earn them.
 
 const STYLES: Record<string, string> = {
+  Sui: "border-blue-500/30 bg-blue-500/10 text-blue-300",
   DeepBook: "border-sky-500/30 bg-sky-500/10 text-sky-300",
   Walrus: "border-cyan-500/30 bg-cyan-500/10 text-cyan-300",
-  gnina: "border-violet-500/30 bg-violet-500/10 text-violet-300",
   Solvimon: "border-emerald-500/30 bg-emerald-500/10 text-emerald-300",
   Vercel: "border-zinc-500/30 bg-zinc-500/10 text-zinc-300",
 };

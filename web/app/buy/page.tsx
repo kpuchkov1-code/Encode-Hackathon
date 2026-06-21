@@ -42,8 +42,8 @@ export default function BuyHome() {
         </h1>
         <p className="mt-5 max-w-xl text-lg leading-relaxed text-muted">
           A 100k-compound screen costs ~$50k on the cloud. Submit it here instead: idle
-          GPUs run real <span className="text-foreground">gnina</span> docking, payment
-          settles on-chain, and every result carries a cryptographic proof that your
+          GPUs run real <span className="text-foreground">molecular docking</span>, payment
+          settles on-chain on Sui, and every result carries a cryptographic proof that your
           unpublished molecule was processed and never altered.
         </p>
 
@@ -78,7 +78,7 @@ export default function BuyHome() {
         <div className="mt-12 flex flex-wrap items-center gap-x-5 gap-y-3 border-t border-border pt-6 text-sm text-muted">
           <span>Powered by</span>
           <span className="flex items-center gap-2">
-            <SponsorBadge name="gnina" /> real CNN docking
+            <SponsorBadge name="Sui" /> blockchain
           </span>
           <span className="flex items-center gap-2">
             <SponsorBadge name="DeepBook" /> on-chain escrow

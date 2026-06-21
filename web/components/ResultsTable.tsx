@@ -1,12 +1,11 @@
 "use client";
 
 import type { DockResult, LigandResult } from "@/lib/types";
-import { SponsorBadge } from "./SponsorBadge";
 
 function toCsv(rows: LigandResult[]): string {
-  const header = "rank,ligand_id,cnn_affinity,cnn_score,vina_affinity,pose_path";
+  const header = "rank,ligand_id,affinity_kcal_per_mol,pose_path";
   const lines = rows.map((l, i) =>
-    [i + 1, l.ligand_id, l.cnn_affinity, l.cnn_score, l.vina_affinity, l.pose_path].join(","),
+    [i + 1, l.ligand_id, l.vina_affinity, l.pose_path].join(","),
   );
   return [header, ...lines].join("\n");
 }
@@ -22,16 +21,15 @@ function downloadCsv(result: DockResult, rows: LigandResult[]) {
 }
 
 export function ResultsTable({ result }: { result: DockResult | undefined }) {
-  // Defensive: rank by cnn_affinity desc (best binder first).
+  // Rank by docking affinity ascending — more negative kcal/mol = stronger binder.
   const rows = result
-    ? [...result.ligands].sort((a, b) => b.cnn_affinity - a.cnn_affinity)
+    ? [...result.ligands].sort((a, b) => a.vina_affinity - b.vina_affinity)
     : [];
 
   return (
     <div className="rounded-xl border border-border bg-surface p-5">
       <div className="mb-4 flex items-center gap-2">
         <h2 className="text-sm font-semibold tracking-tight">Docking results</h2>
-        <SponsorBadge name="gnina" />
         {result && rows.length > 0 && (
           <button
             type="button"
@@ -42,7 +40,7 @@ export function ResultsTable({ result }: { result: DockResult | undefined }) {
           </button>
         )}
         {(!result || rows.length === 0) && (
-          <span className="ml-auto text-[11px] text-muted">ranked by CNN affinity</span>
+          <span className="ml-auto text-[11px] text-muted">ranked by affinity</span>
         )}
       </div>
 
@@ -55,9 +53,7 @@ export function ResultsTable({ result }: { result: DockResult | undefined }) {
               <tr className="border-b border-border text-[11px] uppercase tracking-wider text-muted">
                 <th className="py-2 pr-3 font-medium">#</th>
                 <th className="py-2 pr-3 font-medium">Ligand</th>
-                <th className="py-2 pr-3 text-right font-medium">CNN aff.</th>
-                <th className="py-2 pr-3 text-right font-medium">CNN score</th>
-                <th className="py-2 text-right font-medium">Vina aff.</th>
+                <th className="py-2 text-right font-medium">Affinity (kcal/mol)</th>
               </tr>
             </thead>
             <tbody className="font-mono">
@@ -79,13 +75,7 @@ export function ResultsTable({ result }: { result: DockResult | undefined }) {
                         </span>
                       )}
                     </td>
-                    <td className="py-2.5 pr-3 text-right font-semibold text-foreground">
-                      {lig.cnn_affinity.toFixed(2)}
-                    </td>
-                    <td className="py-2.5 pr-3 text-right text-muted">
-                      {lig.cnn_score.toFixed(3)}
-                    </td>
-                    <td className="py-2.5 text-right text-muted">
+                    <td className="py-2.5 text-right font-semibold text-foreground">
                       {lig.vina_affinity.toFixed(2)}
                     </td>
                   </tr>
@@ -94,7 +84,7 @@ export function ResultsTable({ result }: { result: DockResult | undefined }) {
             </tbody>
           </table>
           <p className="mt-3 text-[11px] text-muted">
-            Higher CNN affinity = stronger predicted binder. Real gnina CNN rescoring.
+            Lower (more negative) affinity = stronger predicted binder.
           </p>
         </div>
       )}

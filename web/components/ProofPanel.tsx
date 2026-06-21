@@ -10,10 +10,16 @@ import { walrusBlob } from "@/lib/explorer";
 export function ProofPanel({ proof }: { proof: Proof | undefined }) {
   return (
     <div className="rounded-xl border border-accent/30 bg-surface p-5">
-      <div className="mb-4 flex items-center gap-2">
+      <div className="mb-2 flex items-center gap-2">
         <h2 className="text-sm font-semibold tracking-tight">Proof of execution</h2>
         <SponsorBadge name="Walrus" />
+        <SponsorBadge name="Sui" />
       </div>
+      <p className="mb-4 text-[11px] text-muted">
+        The result manifest is anchored on <span className="text-foreground">Walrus</span>{" "}
+        decentralized storage (Sui) — a public, tamper-evident record that your molecule was
+        processed unaltered.
+      </p>
 
       {!proof ? (
         <p className="text-sm text-muted">
@@ -58,7 +64,7 @@ export function ProofPanel({ proof }: { proof: Proof | undefined }) {
                 )}
               </span>
             </Row>
-            <Row label="gnina_version">
+            <Row label="docking_engine">
               <span className="font-mono text-foreground/90">{proof.gnina_version}</span>
             </Row>
             <Row label="worker_id">

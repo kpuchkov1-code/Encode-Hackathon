@@ -8,7 +8,7 @@
   location from the receptor's bound-ligand atoms and place a clearly-labelled representative
   candidate there. While the job is `running` we re-place it (the search) and spin; once
   `docked` we settle on the best pose, stop, and focus. Pass a real `poseSdf` (from the
-  backend) to render an actual gnina pose instead — nothing else changes.
+  backend) to render the actual docked pose instead — nothing else changes.
 */
 
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -220,7 +220,7 @@ export function DockingViewer({
         </div>
         <div className="pointer-events-none absolute bottom-2 left-3 max-w-[90%] font-mono text-[9px] leading-tight text-muted">
           {poseSdf
-            ? "gnina pose · rendered from backend SDF"
+            ? "docked pose · rendered from backend SDF"
             : "representative pose · pocket inferred from bound-ligand atoms"}
         </div>
       </div>

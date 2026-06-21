@@ -32,12 +32,12 @@ export default function DocsPage() {
           region — the selection becomes your docking box.
         </Step>
         <Step n={3} title="Add ligands & submit">
-          Paste SMILES or drop an <Code>.sdf</Code>, pick a provider, and submit. Payment is
-          held in on-chain escrow until the run is proven.
+          Drop an <Code>.sdf</Code> ligand library and submit. The price is set by the
+          network and held in on-chain escrow on Sui until the run is proven.
         </Step>
         <Step n={4} title="Read the results">
           Watch the candidate settle into the pocket as the job runs, then export the ranked
-          gnina / CNN affinity scores as CSV.
+          docking affinity scores as CSV.
         </Step>
       </Card>
 
