@@ -333,17 +333,84 @@ def estimate_job(job_spec: JobSpec) -> dict:
     }
 
 
-@app.post("/jobs", status_code=202)
-def submit_job(job_spec: JobSpec) -> dict:
+def _submit_internal(job_spec: JobSpec) -> dict:
     """Creates a job in `pending_payment` -- it is NOT queued for execution until
     POST /jobs/{id}/confirm is called. Price is always computed here, server-side,
-    never taken from the client."""
+    never taken from the client. Used by the server-rendered form AND (via translation)
+    the SPA's POST /jobs below."""
     if models.get_researcher(job_spec.researcher_id) is None:
         raise HTTPException(status_code=400, detail="unknown researcher_id -- sign up at /researchers/signup first")
     spec_dict = job_spec.model_dump()
     num_ligands = count_ligands(job_spec.ligands_sdf)
     price = estimate_price(num_ligands, job_spec.params.exhaustiveness)
     return models.create_job(spec_dict, price=price, researcher_id=job_spec.researcher_id)
+
+
+# ---- SPA-facing POST /jobs (API_CONTRACT.md JobSpec) -----------------------------------
+# The frontend posts the contract shape: ligands as an array, an optional researcher
+# identifier (its connected wallet address or email), and payment carrying an `amount` the
+# server ignores (price is always computed here). We translate that into the internal
+# JobSpec and reuse _submit_internal so there's one job-creation code path.
+
+class FeLigand(BaseModel):
+    id: str
+    smiles: Optional[str] = None
+    sdf: Optional[str] = None
+
+
+class FePayment(BaseModel):
+    amount: Optional[float] = None  # ignored -- price is server-computed
+    supplier_id: str = "any"
+
+
+class FeJobSpec(BaseModel):
+    receptor: ReceptorSpec
+    ligands: list[FeLigand] = Field(min_length=1)
+    box: BoxSpec
+    params: ParamsSpec
+    payment: FePayment = FePayment()
+    # Researcher identity for "my jobs" grouping. In the on-chain product this is the
+    # researcher's wallet address; email also works. Optional -- falls back to a shared
+    # anonymous identity so a wallet-only user can still submit.
+    researcher: Optional[str] = None
+
+
+ANON_RESEARCHER_EMAIL = "anonymous@dockmarket.local"
+
+
+def _ligands_to_sdf(ligands: list[FeLigand]) -> str:
+    """Concatenate per-ligand SDF into the single multi-molecule SDF the engine splits on
+    `$$$$`. The control plane is dependency-light (no RDKit), so it can't embed 3D from a
+    SMILES string -- ligands must carry `sdf`. A SMILES-only ligand is a clear 400."""
+    blocks = []
+    for lig in ligands:
+        if not lig.sdf:
+            raise HTTPException(
+                status_code=400,
+                detail=f"ligand '{lig.id}' has no sdf -- the backend needs 3D SDF, not SMILES alone",
+            )
+        block = lig.sdf if lig.sdf.rstrip().endswith("$$$$") else lig.sdf.rstrip() + "\n$$$$\n"
+        blocks.append(block)
+    return "".join(blocks)
+
+
+@app.post("/jobs", status_code=202)
+def submit_job(spec: FeJobSpec) -> dict:
+    """SPA job submission (API_CONTRACT.md). Returns `{job_id, state, price}` -- state is
+    `pending_payment`; the SPA then drives confirm -> wallet lock -> escrow-locked to queue
+    it (or, off-chain, confirm queues directly)."""
+    researcher = models.get_researcher_by_email(spec.researcher or "") or None
+    if researcher is None:
+        researcher = models.create_researcher_identity(spec.researcher or ANON_RESEARCHER_EMAIL)
+    internal = JobSpec(
+        receptor=spec.receptor,
+        ligands_sdf=_ligands_to_sdf(spec.ligands),
+        box=spec.box,
+        params=spec.params,
+        payment=PaymentSpec(supplier_id=spec.payment.supplier_id),
+        researcher_id=researcher["researcher_id"],
+    )
+    return _submit_internal(internal)
 
 
 @app.post("/jobs/{job_id}/confirm")
@@ -1383,7 +1450,7 @@ async def researchers_submit_handler(
         payment=PaymentSpec(supplier_id="any"),
         researcher_id=researcher_id,
     )
-    created = submit_job(job_spec)
+    created = _submit_internal(job_spec)
     job_id, price = created["job_id"], created["price"]
     num_ligands = created.get("num_ligands", count_ligands(ligands_sdf))
     pricing_badge = (
