@@ -31,7 +31,7 @@ export function JobPanel() {
   const job = useJobDraft();
   const router = useRouter();
   const account = useCurrentAccount();
-  const { pdbId, uploaded, source, receptor } = useStructure();
+  const { pdbId, uploaded, source, receptor, text: receptorText } = useStructure();
   const [running, setRunning] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -44,7 +44,9 @@ export function JobPanel() {
 
   const { draft, jobId } = job;
   const hasDraft = draft.ligands.length > 0 || draft.pocket !== null;
-  if (!hasDraft && !jobId) return null;
+  // Show the submit surface as soon as a receptor is loaded (not only once ligands exist),
+  // so there's always a visible "Run screen" button — you add ligands right here.
+  if (!hasDraft && !jobId && !receptorText) return null;
 
   const provider = providerById(draft.supplierId) ?? PROVIDERS[0];
   const ligandCount = Math.max(1, draft.ligands.length);

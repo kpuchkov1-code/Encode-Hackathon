@@ -126,8 +126,8 @@ async function execServerTool(call: ToolCall): Promise<unknown> {
 // ---- gateway call ----
 
 async function callGateway(messages: ChatMessage[]): Promise<ChatMessage> {
-  const key = process.env.AI_GATEWAY_API_KEY;
-  if (!key) throw new Error("AI_GATEWAY_API_KEY is not set");
+  const key = process.env.AI_GATEWAY_API_KEY ?? process.env.VERCEL_API_KEY;
+  if (!key) throw new Error("AI_GATEWAY_API_KEY / VERCEL_API_KEY is not set");
   const res = await fetch(GATEWAY_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
