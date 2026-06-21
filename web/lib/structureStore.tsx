@@ -102,12 +102,15 @@ export function StructureProvider({
     }
     let cancelled = false;
     const timer = setTimeout(async () => {
+      // An upload (loadText) may have landed during the debounce window — if so, don't
+      // clobber the uploaded receptor with the default id's RCSB fetch.
+      if (manualRef.current) return;
       setStatus("loading");
       try {
         const res = await fetch(`https://files.rcsb.org/download/${id}.pdb`);
         if (!res.ok) throw new Error(`PDB ${id} not found`);
         const raw = await res.text();
-        if (cancelled) return;
+        if (cancelled || manualRef.current) return;
         setText(raw);
         setParsed(parsePdb(raw));
         setSource("RCSB");
